@@ -1,0 +1,43 @@
+# 환경 변수 (비밀키 포함)
+.env
+.env.local
+.env.*.local
+
+# DB 및 로그
+*.db
+*.log
+autotrade.db
+autotrade.log
+
+# 인증/키 파일
+token.json
+gemini_service_account.json
+*.pem
+*.key
+
+# 런타임 상태
+trade_status.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
