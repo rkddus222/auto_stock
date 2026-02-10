@@ -1,10 +1,14 @@
-
-import requests
 from app.api.kis_auth import kis_auth
+from app.api.kis_http import kis_get, kis_post
 from app.api.kis_retry import kis_retry, rate_limited
 from app.core.config import settings
 from app.core.logger import logger
 from app.core.exceptions import OrderError, APIRequestError
+
+
+def _balance_tr_id() -> str:
+    """잔고조회 tr_id: 모의투자 VTTC8434R, 실전 TTTC8434R"""
+    return "VTTC8434R" if settings.MOCK_TRADE else "TTTC8434R"
 
 
 def _get_account_parts():
@@ -36,7 +40,10 @@ def place_order(symbol: str, quantity: int, price: int, order_type: str):
     url = f"{kis_auth.base_url}{path}"
 
     order_code = "00" if price > 0 else "01"
-    tr_id = "TTTC0802U" if order_type == "BUY" else "TTTC0801U"
+    if settings.MOCK_TRADE:
+        tr_id = "VTTC0802U" if order_type == "BUY" else "VTTC0801U"
+    else:
+        tr_id = "TTTC0802U" if order_type == "BUY" else "TTTC0801U"
     cano, acnt_prdt_cd = _get_account_parts()
 
     headers = {
@@ -57,10 +64,10 @@ def place_order(symbol: str, quantity: int, price: int, order_type: str):
     }
 
     try:
-        response = requests.post(url, headers=headers, json=body)
+        response = kis_post(url, headers=headers, json=body)
         res = response.json()
         if res["rt_cd"] == "0":
-            logger.info(f'주문 성공: {res["msg1"]}')
+            logger.debug(f'주문 성공: {res["msg1"]}')
             return res
         else:
             raise OrderError(f'주문 실패: {res["msg1"]}')
@@ -84,7 +91,7 @@ def get_balance():
         "authorization": f"Bearer {kis_auth.access_token}",
         "appKey": kis_auth._app_key,
         "appSecret": kis_auth._app_secret,
-        "tr_id": "TTTC8434R",
+        "tr_id": _balance_tr_id(),
     }
     params = {
         "CANO": cano,
@@ -101,7 +108,7 @@ def get_balance():
     }
 
     try:
-        response = requests.get(url, headers=headers, params=params)
+        response = kis_get(url, headers=headers, params=params)
         res = response.json()
         if res["rt_cd"] == "0":
             return res["output1"]
@@ -136,7 +143,7 @@ def get_cash_balance():
         "authorization": f"Bearer {kis_auth.access_token}",
         "appKey": kis_auth._app_key,
         "appSecret": kis_auth._app_secret,
-        "tr_id": "TTTC8434R",
+        "tr_id": _balance_tr_id(),
     }
     base_params = {
         "CANO": cano,
@@ -151,17 +158,18 @@ def get_cash_balance():
         "CTX_AREA_NK100": "",
     }
 
+    # 모의투자에서는 INQR_DVSN "02"(요약)가 INVALID_CHECK_INQR_DVSN 오류를 일으킬 수 있어 "01"(주식별) 먼저 시도
     try:
-        params_02 = {**base_params, "INQR_DVSN": "02"}
-        response = requests.get(url, headers=headers, params=params_02)
+        params_01 = {**base_params, "INQR_DVSN": "01"}
+        response = kis_get(url, headers=headers, params=params_01)
         res = response.json()
         if res.get("rt_cd") != "0":
             raise APIRequestError(res.get("msg1", "예수금 조회 실패"))
         cash = _parse_cash_from_balance_response(res)
         if cash > 0:
             return cash
-        params_01 = {**base_params, "INQR_DVSN": "01"}
-        response = requests.get(url, headers=headers, params=params_01)
+        params_02 = {**base_params, "INQR_DVSN": "02"}
+        response = kis_get(url, headers=headers, params=params_02)
         res = response.json()
         if res.get("rt_cd") != "0":
             raise APIRequestError(res.get("msg1", "예수금 조회 실패"))

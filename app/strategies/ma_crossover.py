@@ -57,7 +57,7 @@ class MACrossover(Strategy):
 
             # 상향 돌파: 이전에는 short < long, 현재 short >= long
             if prev_short < prev_long and short_ma >= long_ma:
-                logger.info(f"[{symbol}] MA 상향 돌파 매수 신호 (단기={short_ma:.2f}, 장기={long_ma:.2f})")
+                logger.debug(f"[{symbol}] MA 상향 돌파 매수 신호 (단기={short_ma:.2f}, 장기={long_ma:.2f})")
                 self.log_decision(
                     symbol, "BUY", "단기 MA가 장기 MA 상향 돌파", indicators, current_price, "EXECUTED"
                 )
@@ -65,7 +65,7 @@ class MACrossover(Strategy):
 
             # 하향 돌파: 이전에는 short > long, 현재 short <= long
             if prev_short > prev_long and short_ma <= long_ma:
-                logger.info(f"[{symbol}] MA 하향 돌파 매도 신호 (단기={short_ma:.2f}, 장기={long_ma:.2f})")
+                logger.debug(f"[{symbol}] MA 하향 돌파 매도 신호 (단기={short_ma:.2f}, 장기={long_ma:.2f})")
                 self.log_decision(
                     symbol, "SELL", "단기 MA가 장기 MA 하향 돌파", indicators, current_price, "EXECUTED"
                 )

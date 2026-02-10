@@ -24,7 +24,7 @@ except ModuleNotFoundError as e:
     print("실행은 루트에서: uvicorn app.main:app --reload --host 0.0.0.0 --port 8000", file=sys.stderr)
     sys.exit(1)
 
-from app.api import kis_order, kis_market
+from app.api import kis_order, kis_market, kis_condition
 from app.core.config import settings
 from app.core.logger import logger
 from app.core.slack import send_slack_notification
@@ -41,13 +41,14 @@ scheduler = AsyncIOScheduler()
 target_symbols: list[str] = []
 trade_status: dict = {}
 trading_enabled = True  # API로 on/off 가능
+_last_slot_scan_time: float = 0.0  # 빈 자리 채우기: 마지막 종목 검색 시각 (초)
 
 # WebSocket: 매매 이벤트 브로드캐스트용 (스레드에서 넣고, async 태스크가 전송)
 _pending_broadcasts: list[dict] = []
 _broadcast_lock = threading.Lock()
 
 DEFAULT_STRATEGY_NAME = "volatility_breakout"
-DEFAULT_STRATEGY_PARAMS = {"ma_period": 20, "trailing_stop_pct": 5.0, "k": getattr(settings, "VOLATILITY_BREAKOUT_K", 0.5)}
+DEFAULT_STRATEGY_PARAMS = {"ma_period": 20, "trailing_stop_pct": 3.0, "k": getattr(settings, "VOLATILITY_BREAKOUT_K", 0.5)}
 
 
 def get_strategy_for_symbol(symbol: str):
@@ -78,25 +79,48 @@ def save_trade_status():
 
 
 def load_trade_status():
-    """JSON 파일에서 거래 상태를 불러옵니다."""
+    """JSON 파일에서 거래 상태를 불러옵니다. 조건검색 사용 시 HTS 조건검색 결과로 대상 종목을 갱신합니다."""
     global trade_status, target_symbols
-    target_symbols = settings.target_symbols_list
-    if not target_symbols:
-        logger.warning("TARGET_SYMBOLS가 비어 있습니다. 기본 종목을 사용합니다.")
-        target_symbols = ["005930", "000660"]
     try:
         with open(TRADE_STATUS_FILE, "r", encoding="utf-8") as f:
             trade_status = json.load(f)
         logger.info("거래 상태를 파일에서 성공적으로 불러왔습니다.")
     except (FileNotFoundError, json.JSONDecodeError):
+        trade_status = {}
         logger.warning("거래 상태 파일을 찾을 수 없어 새로 생성합니다.")
-        trade_status = {
-            symbol: {"bought": False, "purchase_price": 0.0, "quantity": 0, "stop_price": 0.0}
-            for symbol in target_symbols
-        }
 
-def _log_trade(symbol: str, order_type: str, price: float, quantity: int, status: OrderStatus, kis_response: dict | None):
-    """주문 결과를 DB에 기록합니다."""
+    holding = [s for s, st in trade_status.items() if st.get("bought")]
+    if settings.USE_VOLUME_RANK:
+        # 거래량 상위 API 사용 (HTS 불필요)
+        dynamic_list = kis_condition.get_top_volume_stocks()
+        if dynamic_list:
+            target_symbols = holding + [s for s in dynamic_list if s not in holding][: settings.CONDITION_SEARCH_MAX]
+            logger.info(f"거래량 순위 적용: 대상 종목 {target_symbols} (보유 {len(holding)} + 신규 {len(target_symbols) - len(holding)})")
+        else:
+            target_symbols = settings.target_symbols_list or ["005930", "000660"]
+            logger.warning("거래량 순위 결과가 비어 있어 TARGET_SYMBOLS로 대체합니다.")
+    elif settings.USE_CONDITION_SEARCH:
+        condition_list = kis_condition.get_target_stocks_by_condition()
+        if condition_list:
+            target_symbols = holding + [s for s in condition_list if s not in holding][: settings.CONDITION_SEARCH_MAX]
+            logger.info(f"조건검색 적용: 대상 종목 {target_symbols} (보유 {len(holding)} + 신규 {len(target_symbols) - len(holding)})")
+        else:
+            target_symbols = settings.target_symbols_list or ["005930", "000660"]
+            logger.warning("조건검색 결과가 비어 있어 TARGET_SYMBOLS로 대체합니다.")
+    else:
+        target_symbols = settings.target_symbols_list
+        if not target_symbols:
+            logger.warning("TARGET_SYMBOLS가 비어 있습니다. 기본 종목을 사용합니다.")
+            target_symbols = ["005930", "000660"]
+
+    for symbol in target_symbols:
+        trade_status.setdefault(
+            symbol,
+            {"bought": False, "purchase_price": 0.0, "quantity": 0, "stop_price": 0.0},
+        )
+
+def _log_trade(symbol: str, order_type: str, price: float, quantity: int, status: OrderStatus, kis_response: dict | None, realized_pl: float | None = None):
+    """주문 결과를 DB에 기록합니다. SELL 시 realized_pl(매도금액-원금)을 넘기면 실현손익으로 저장합니다."""
     try:
         db = session.SessionLocal()
         try:
@@ -107,6 +131,7 @@ def _log_trade(symbol: str, order_type: str, price: float, quantity: int, status
                 quantity=quantity,
                 status=status,
                 kis_response=json.dumps(kis_response, ensure_ascii=False) if kis_response else None,
+                realized_pl=realized_pl if realized_pl is not None else 0.0,
             )
             db.add(log)
             db.commit()
@@ -118,14 +143,50 @@ def _log_trade(symbol: str, order_type: str, price: float, quantity: int, status
 
 # --- Trading Jobs ---
 def run_trading_strategy():
-    """자동 매매 전략 실행 (매수 및 트레일링 스톱)"""
+    """자동 매매 전략 실행 (매수 및 트레일링 스톱). 빈 자리 있으면 주기적으로 종목 재검색."""
+    global target_symbols, _last_slot_scan_time
     if not trading_enabled:
         return
-    logger.info("자동 매매 로직 실행: 매수 및 트레일링 스톱 모니터링")
+
+    # --- 빈 자리 채우기: 동적 종목(거래량/조건검색) 사용 시, 슬롯 제한 및 주기 재검색 ---
+    use_dynamic = settings.USE_VOLUME_RANK or settings.USE_CONDITION_SEARCH
+    if use_dynamic:
+        current_holdings = [s for s, st in trade_status.items() if st.get("bought")]
+        holding_count = len(current_holdings)
+        max_slots = settings.MAX_SLOTS or 3
+        scan_interval = settings.SCAN_INTERVAL or 60
+
+        if holding_count >= max_slots:
+            # 꽉 찼으면 보유 종목만 감시
+            target_symbols = current_holdings
+        elif (time.time() - _last_slot_scan_time) >= scan_interval:
+            # 자리 비었고, 마지막 검색 후 간격 경과 → 새 후보 검색
+            logger.info(f"빈 슬롯 발견 ({holding_count}/{max_slots}). 새 종목 탐색 중...")
+            try:
+                if settings.USE_VOLUME_RANK:
+                    new_candidates = kis_condition.get_top_volume_stocks()
+                else:
+                    new_candidates = kis_condition.get_target_stocks_by_condition()
+                real_targets = [c for c in new_candidates if c not in current_holdings]
+                slots_needed = max_slots - holding_count
+                target_symbols = current_holdings + real_targets[:slots_needed]
+                for symbol in target_symbols:
+                    trade_status.setdefault(
+                        symbol,
+                        {"bought": False, "purchase_price": 0.0, "quantity": 0, "stop_price": 0.0},
+                    )
+                _last_slot_scan_time = time.time()
+                logger.info(f"타겟 리스트 갱신: {target_symbols} (보유 {holding_count} + 신규 {len(target_symbols) - holding_count})")
+            except Exception as e:
+                logger.error(f"빈 자리 채우기 검색 실패: {e}")
+
+    logger.debug("자동 매매 로직 실행: 매수 및 트레일링 스톱 모니터링")
     try:
         cash_balance = kis_order.get_cash_balance()
         ratio = max(0.01, min(1.0, settings.BUDGET_RATIO))
-        budget_per_stock = (cash_balance * ratio) / len(target_symbols) if target_symbols else 0
+        current_holdings = sum(1 for st in trade_status.values() if st.get("bought"))
+        open_slots = max(1, (settings.MAX_SLOTS or 3) - current_holdings)
+        budget_per_stock = (cash_balance * ratio) / open_slots
     except Exception as e:
         logger.error(f"예수금 조회 실패: {e}")
         return
@@ -133,7 +194,7 @@ def run_trading_strategy():
     for symbol in target_symbols:
         try:
             strategy = get_strategy_for_symbol(symbol)
-            trailing_pct = strategy.get_parameters().get("trailing_stop_pct", 5.0)
+            trailing_pct = strategy.get_parameters().get("trailing_stop_pct", 3.0)
             current_price = kis_market.get_current_price(symbol)
 
             # 1. 매수 상태: 트레일링 스톱 및 전략 SELL 신호 확인
@@ -141,13 +202,40 @@ def run_trading_strategy():
                 stop_price = trade_status[symbol]["stop_price"]
                 quantity = trade_status[symbol]["quantity"]
 
+                # VI (+10% 급등) 절반 매도: 머리 꼭대기 근처에서 수익 확정
+                purchase_price = trade_status[symbol].get("purchase_price", 0) or 0
+                vi_sell_done = trade_status[symbol].get("vi_sell_done", False)
+                if (
+                    not vi_sell_done
+                    and purchase_price > 0
+                    and current_price >= purchase_price * 1.10
+                    and quantity >= 2
+                ):
+                    sell_qty = quantity // 2
+                    logger.info(f"[{symbol}] VI(급등 +10%) 절반 매도! 현재가: {current_price:.0f}, 매수가: {purchase_price:.0f}, {sell_qty}주 매도")
+                    try:
+                        res = kis_order.place_order(symbol=symbol, quantity=sell_qty, price=0, order_type="SELL")
+                        pl = (current_price - purchase_price) * sell_qty
+                        _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.EXECUTED, res, realized_pl=pl)
+                        send_slack_notification(f"[VI 절반 매도] {symbol} ({sell_qty}주) | 현재가: {current_price:.0f} (+10% 급등)")
+                        trade_status[symbol]["quantity"] = quantity - sell_qty
+                        trade_status[symbol]["vi_sell_done"] = True
+                        save_trade_status()
+                        queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": sell_qty})
+                    except Exception as e:
+                        _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.FAILED, None)
+                        logger.error(f"[{symbol}] VI 절반 매도 실패: {e}")
+                    time.sleep(0.2)
+                    continue
+
                 # 전략 SELL 신호 확인
                 signal, _ = strategy.check_signal(symbol)
                 if signal == "SELL":
                     logger.info(f"[{symbol}] 전략 매도 신호 실행")
                     try:
                         res = kis_order.place_order(symbol=symbol, quantity=quantity, price=0, order_type="SELL")
-                        _log_trade(symbol, "SELL", current_price, quantity, OrderStatus.EXECUTED, res)
+                        pl = (current_price - purchase_price) * quantity
+                        _log_trade(symbol, "SELL", current_price, quantity, OrderStatus.EXECUTED, res, realized_pl=pl)
                         send_slack_notification(f"[전략 매도] {symbol} ({quantity}주) | 현재가: {current_price:.0f}")
                         trade_status[symbol] = {"bought": False, "purchase_price": 0.0, "quantity": 0, "stop_price": 0.0}
                         save_trade_status()
@@ -163,7 +251,8 @@ def run_trading_strategy():
                     logger.info(f"[{symbol}] 트레일링 스톱 매도! 현재가: {current_price}, 손절가: {stop_price}")
                     try:
                         res = kis_order.place_order(symbol=symbol, quantity=quantity, price=0, order_type="SELL")
-                        _log_trade(symbol, "SELL", current_price, quantity, OrderStatus.EXECUTED, res)
+                        pl = (current_price - purchase_price) * quantity
+                        _log_trade(symbol, "SELL", current_price, quantity, OrderStatus.EXECUTED, res, realized_pl=pl)
                         send_slack_notification(f"[트레일링 스톱] {symbol} ({quantity}주) | 현재가: {current_price:.0f}")
                         trade_status[symbol] = {"bought": False, "purchase_price": 0.0, "quantity": 0, "stop_price": 0.0}
                         save_trade_status()
@@ -177,7 +266,7 @@ def run_trading_strategy():
                 new_stop_price = current_price * (1 - trailing_pct / 100)
                 if new_stop_price > stop_price:
                     trade_status[symbol]["stop_price"] = new_stop_price
-                    logger.info(f"[{symbol}] 스톱 가격 상향 조정 -> {new_stop_price:.0f}")
+                    logger.debug(f"[{symbol}] 스톱 가격 상향 조정 -> {new_stop_price:.0f}")
                     save_trade_status()
 
             # 2. 미매수 상태: 매수 신호 확인
@@ -198,6 +287,7 @@ def run_trading_strategy():
                             "purchase_price": price_at_signal,
                             "quantity": quantity_to_buy,
                             "stop_price": initial_stop_price,
+                            "vi_sell_done": False,
                         }
                         logger.info(f"[{symbol}] 매수 성공! 손절가: {initial_stop_price:.0f}")
                         send_slack_notification(f"[매수 성공] {symbol}({quantity_to_buy}주) | 매수가: {price_at_signal:.0f}")
@@ -215,16 +305,22 @@ def run_trading_strategy():
 
 def sell_all_at_close():
     """장 마감 전량 매도 (스케줄 또는 API 호출)"""
-    logger.info("장 마감 전량 매도 로직을 시작합니다.")
-    for symbol in target_symbols:
-        if trade_status.get(symbol, {}).get("bought"):
-            quantity = trade_status[symbol]["quantity"]
+    global trading_enabled
+    trading_enabled = False  # 매도 중 재매수 방지
+    logger.info("장 마감 전량 매도 로직을 시작합니다. (자동매매 비활성화)")
+    # trade_status 전체 순회: target_symbols가 아닌 실제 보유 종목 기준
+    for symbol, st in list(trade_status.items()):
+        if st.get("bought"):
+            quantity = st["quantity"]
+            purchase_price = st.get("purchase_price", 0) or 0
             try:
+                current_price = kis_market.get_current_price(symbol)
                 res = kis_order.place_order(symbol=symbol, quantity=quantity, price=0, order_type="SELL")
-                _log_trade(symbol, "SELL", 0.0, quantity, OrderStatus.EXECUTED, res)
-                send_slack_notification(f"[장 마감 매도] {symbol}, 수량: {quantity}")
+                pl = (current_price - purchase_price) * quantity if purchase_price else 0.0
+                _log_trade(symbol, "SELL", current_price, quantity, OrderStatus.EXECUTED, res, realized_pl=pl)
+                send_slack_notification(f"[장 마감 매도] {symbol}, 수량: {quantity}, 현재가: {current_price:.0f}")
                 trade_status[symbol] = {"bought": False, "purchase_price": 0.0, "quantity": 0, "stop_price": 0.0}
-                queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": 0.0, "quantity": quantity})
+                queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": quantity})
             except Exception as e:
                 _log_trade(symbol, "SELL", 0.0, quantity, OrderStatus.FAILED, None)
                 logger.error(f"[{symbol}] 장 마감 매도 실패: {e}")
@@ -246,6 +342,37 @@ def job_reconciliation():
         reconciliation_service.run_reconciliation(trade_status)
     except Exception as e:
         logger.error(f"리콘실리에이션 실패: {e}")
+
+
+def enable_trading_morning():
+    """매일 장 시작 전 자동매매를 재활성화합니다 (전일 sell_all_at_close에서 비활성화된 것을 복원)."""
+    global trading_enabled
+    trading_enabled = True
+    logger.info("장 시작: 자동매매 활성화")
+
+
+def refresh_target_symbols_from_condition():
+    """거래량 순위 또는 조건검색 사용 시 장중(09:10)에 대상 종목을 한 번 더 갱신합니다."""
+    if not settings.USE_VOLUME_RANK and not settings.USE_CONDITION_SEARCH:
+        return
+    global target_symbols
+    try:
+        holding = [s for s, st in trade_status.items() if st.get("bought")]
+        if settings.USE_VOLUME_RANK:
+            dynamic_list = kis_condition.get_top_volume_stocks()
+        else:
+            dynamic_list = kis_condition.get_target_stocks_by_condition()
+        if dynamic_list:
+            target_symbols = holding + [s for s in dynamic_list if s not in holding][: settings.CONDITION_SEARCH_MAX]
+            for symbol in target_symbols:
+                trade_status.setdefault(
+                    symbol,
+                    {"bought": False, "purchase_price": 0.0, "quantity": 0, "stop_price": 0.0},
+                )
+            source = "거래량 순위" if settings.USE_VOLUME_RANK else "조건검색"
+            logger.info(f"{source} 장중 갱신: 대상 종목 {len(target_symbols)} (보유 {len(holding)} + 신규 {len(target_symbols) - len(holding)})")
+    except Exception as e:
+        logger.error(f"대상 종목 장중 갱신 실패: {e}")
 
 
 def queue_broadcast(message: dict) -> None:
@@ -278,8 +405,12 @@ async def price_update_broadcaster():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     models.Base.metadata.create_all(bind=session.engine)
+    from app.db.migrate import run_migrations
+    run_migrations()
     load_trade_status()
+    scheduler.add_job(enable_trading_morning, 'cron', day_of_week='mon-fri', hour=8, minute=59, id="enable_trading_job")
     scheduler.add_job(run_trading_strategy, 'cron', day_of_week='mon-fri', hour='9-15', minute='*', second='*/10', id="trading_job")
+    scheduler.add_job(refresh_target_symbols_from_condition, 'cron', day_of_week='mon-fri', hour=9, minute=10, id="condition_refresh_job")
     scheduler.add_job(sell_all_at_close, 'cron', day_of_week='mon-fri', hour=15, minute=19, id="sell_all_job")
     scheduler.add_job(job_portfolio_snapshot, 'cron', minute='*/5', id="portfolio_snapshot_job")
     scheduler.add_job(job_reconciliation, 'cron', minute='0,30', id="reconciliation_job")
@@ -351,12 +482,13 @@ def get_status():
                 total_holding += price * st["quantity"]
             except Exception:
                 total_holding += st["purchase_price"] * st["quantity"]
-    # 당일 실현손익: 오늘 체결된 매도 금액 (단순화)
-    from datetime import datetime
+    # 당일 실현손익: 오늘 체결된 매도의 (매도금액 - 원금) 합계
+    from datetime import datetime, timezone, timedelta
+    KST = timezone(timedelta(hours=9))
     today_pl = 0.0
     db = session.SessionLocal()
     try:
-        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start = datetime.now(KST).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).replace(tzinfo=None)
         rows = (
             db.query(models.TradeLog)
             .filter(
@@ -366,7 +498,7 @@ def get_status():
             )
             .all()
         )
-        today_pl = sum(r.price * r.quantity for r in rows if r.price and r.quantity)
+        today_pl = sum(r.realized_pl or 0.0 for r in rows)
     except Exception as e:
         logger.debug(f"당일 손익 집계 스킵: {e}")
     finally:

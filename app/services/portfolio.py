@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from app.api import kis_order, kis_market
 from app.core.logger import logger
@@ -77,7 +77,8 @@ def create_portfolio_snapshot(trade_status: dict):
         total_unrealized += pos["unrealizedPL"]
 
     total_assets = cash + holdings_value
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    KST = timezone(timedelta(hours=9))
+    today_start = datetime.now(KST).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).replace(tzinfo=None)
     realized = calculate_realized_pl(today_start)
 
     # 일일 수익률: 전일 마지막 스냅샷 대비
@@ -104,7 +105,7 @@ def create_portfolio_snapshot(trade_status: dict):
         )
         db.add(snapshot)
         db.commit()
-        logger.info(f"포트폴리오 스냅샷 저장: 총자산={total_assets:.0f}, 현금={cash:.0f}, 보유={holdings_value:.0f}")
+        logger.debug(f"포트폴리오 스냅샷 저장: 총자산={total_assets:.0f}, 현금={cash:.0f}, 보유={holdings_value:.0f}")
     except Exception as e:
         logger.error(f"포트폴리오 스냅샷 저장 실패: {e}")
     finally:

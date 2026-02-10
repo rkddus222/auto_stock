@@ -4,7 +4,7 @@ import logging.handlers
 
 # 로거 인스턴스 생성
 logger = logging.getLogger("autotrade")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 # 포매터 생성
 formatter = logging.Formatter("[%(asctime)s][%(levelname)s] %(message)s")

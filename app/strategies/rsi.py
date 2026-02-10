@@ -65,13 +65,13 @@ class RSIStrategy(Strategy):
             indicators = {"rsi": round(rsi_val, 2), "current_price": current_price}
 
             if rsi_val < self.oversold:
-                logger.info(f"[{symbol}] RSI 과매도 매수 신호 (RSI={rsi_val:.1f})")
+                logger.debug(f"[{symbol}] RSI 과매도 매수 신호 (RSI={rsi_val:.1f})")
                 self.log_decision(
                     symbol, "BUY", f"RSI 과매도 (RSI={rsi_val:.1f} < {self.oversold})", indicators, current_price, "EXECUTED"
                 )
                 return "BUY", current_price
             if rsi_val > self.overbought:
-                logger.info(f"[{symbol}] RSI 과매수 매도 신호 (RSI={rsi_val:.1f})")
+                logger.debug(f"[{symbol}] RSI 과매수 매도 신호 (RSI={rsi_val:.1f})")
                 self.log_decision(
                     symbol, "SELL", f"RSI 과매수 (RSI={rsi_val:.1f} > {self.overbought})", indicators, current_price, "EXECUTED"
                 )

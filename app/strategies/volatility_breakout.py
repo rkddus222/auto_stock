@@ -8,11 +8,11 @@ import numpy as np
 class VolatilityBreakout(Strategy):
     """변동성 돌파 전략 구현체 (트레일링 스톱 추가)"""
 
-    def __init__(self, ma_period=20, trailing_stop_pct=5.0, k=None):
+    def __init__(self, ma_period=20, trailing_stop_pct=3.0, k=None):
         self.k = k if k is not None else settings.VOLATILITY_BREAKOUT_K
         self.ma_period = ma_period
         self.trailing_stop_pct = trailing_stop_pct
-        logger.info(f"전략 초기화: 변동성 돌파(K={self.k}) + {self.ma_period}일 MA 필터 | 트레일링 스톱: {self.trailing_stop_pct}%")
+        logger.debug(f"전략 초기화: 변동성 돌파(K={self.k}) + {self.ma_period}일 MA 필터 | 트레일링 스톱: {self.trailing_stop_pct}%")
 
     def get_strategy_name(self) -> str:
         return "volatility_breakout"
@@ -29,7 +29,7 @@ class VolatilityBreakout(Strategy):
         return [
             {"name": "k", "type": "float", "default": 0.5, "description": "변동성 돌파 K값 (0~1)"},
             {"name": "ma_period", "type": "int", "default": 20, "description": "이동평균 기간 (일)"},
-            {"name": "trailing_stop_pct", "type": "float", "default": 5.0, "description": "트레일링 스톱 비율 (%)"},
+            {"name": "trailing_stop_pct", "type": "float", "default": 3.0, "description": "트레일링 스톱 비율 (%)"},
         ]
 
     def check_signal(self, symbol: str) -> tuple[str, float | None]:
@@ -65,7 +65,7 @@ class VolatilityBreakout(Strategy):
             indicators["volatility"] = round(volatility, 2)
 
             if current_price >= target_price:
-                logger.info(f"[{symbol}] 매수 신호 발생! 목표가 {target_price:.2f} 돌파")
+                logger.debug(f"[{symbol}] 매수 신호 발생! 목표가 {target_price:.2f} 돌파")
                 self.log_decision(symbol, "BUY", f"변동성 돌파 (현재가 >= 목표가 {target_price:.0f})",
                                   indicators, current_price, "EXECUTED")
                 return "BUY", current_price

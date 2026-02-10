@@ -1,5 +1,5 @@
-import requests
 import json
+from app.api.kis_http import kis_post
 import time
 from datetime import datetime, timedelta
 
@@ -48,7 +48,7 @@ class KISAuth:
             "appsecret": self._app_secret
         }
         
-        response = requests.post(url, headers=headers, json=body)
+        response = kis_post(url, headers=headers, json=body)
         if response.status_code != 200:
             raise AuthenticationError(f"토큰 발급 실패: {response.text}")
         

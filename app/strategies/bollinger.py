@@ -57,13 +57,13 @@ class BollingerStrategy(Strategy):
             }
 
             if current_price <= lower:
-                logger.info(f"[{symbol}] 볼린저 하단 밴드 매수 신호 (현재가={current_price:.0f}, 하단={lower:.0f})")
+                logger.debug(f"[{symbol}] 볼린저 하단 밴드 매수 신호 (현재가={current_price:.0f}, 하단={lower:.0f})")
                 self.log_decision(
                     symbol, "BUY", "가격이 하단 밴드 이하", indicators, current_price, "EXECUTED"
                 )
                 return "BUY", current_price
             if current_price >= upper:
-                logger.info(f"[{symbol}] 볼린저 상단 밴드 매도 신호 (현재가={current_price:.0f}, 상단={upper:.0f})")
+                logger.debug(f"[{symbol}] 볼린저 상단 밴드 매도 신호 (현재가={current_price:.0f}, 상단={upper:.0f})")
                 self.log_decision(
                     symbol, "SELL", "가격이 상단 밴드 이상", indicators, current_price, "EXECUTED"
                 )

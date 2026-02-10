@@ -1,6 +1,5 @@
-
-import requests
 from app.api.kis_auth import kis_auth
+from app.api.kis_http import kis_get
 from app.api.kis_retry import kis_retry, rate_limited
 from app.core.logger import logger
 from app.core.exceptions import APIRequestError
@@ -25,7 +24,7 @@ def get_current_price(symbol: str) -> float:
     }
 
     try:
-        response = requests.get(url, headers=headers, params=params)
+        response = kis_get(url, headers=headers, params=params)
         if response.status_code == 200:
             data = response.json()["output"]
             return float(data["stck_prpr"])
@@ -59,9 +58,14 @@ def get_daily_ohlcv(symbol: str, days: int = 30):
     }
 
     try:
-        response = requests.get(url, headers=headers, params=params)
+        response = kis_get(url, headers=headers, params=params)
         if response.status_code == 200:
-            return response.json()["output2"]
+            data = response.json()
+            # KIS API: 일봉 데이터는 output에 배열로 반환 (output2 아님)
+            out = data.get("output2") or data.get("output")
+            if out is None:
+                raise APIRequestError("일봉 데이터 응답에 output/output2 없음")
+            return out if isinstance(out, list) else [out]
         else:
             raise APIRequestError(f"일봉 데이터 조회 실패: {response.text}")
     except APIRequestError:
