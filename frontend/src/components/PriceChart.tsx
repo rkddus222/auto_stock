@@ -14,8 +14,9 @@ interface HistoryPoint {
 
 function formatTime(iso: string | null): string {
   if (!iso) return '';
-  const d = new Date(iso);
-  return d.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
+  const utcStr = /[Z+-]\d{2}:?\d{2}$/.test(iso) ? iso : iso + 'Z';
+  const d = new Date(utcStr);
+  return d.toLocaleTimeString('ko-KR', { timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit' });
 }
 
 const PriceChart = () => {
@@ -36,7 +37,7 @@ const PriceChart = () => {
   }));
 
   return (
-    <div className="bg-gray-800 p-6 rounded-xl shadow-lg h-full">
+    <div className="bg-gray-800 p-6 rounded-xl shadow-lg shrink-0">
       <h3 className="text-lg font-medium text-gray-200 mb-4">포트폴리오 추이 (총자산 / 현금 / 보유주식)</h3>
       <ResponsiveContainer width="100%" height={300}>
         <LineChart data={chartData}>

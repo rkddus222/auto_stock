@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { apiClient } from '../api/client';
+import { symbolNames } from '../constants/stockMap';
 
 interface TradeItem {
   id: number;
@@ -10,11 +11,6 @@ interface TradeItem {
   quantity: number;
   status: string;
 }
-
-const symbolNames: Record<string, string> = {
-  '005930': '삼성전자',
-  '000660': 'SK하이닉스',
-};
 
 const TradeHistory = () => {
   const { data: trades = [], isLoading } = useQuery<TradeItem[]>({
@@ -28,14 +24,21 @@ const TradeHistory = () => {
 
   const formatTime = (iso: string | null) => {
     if (!iso) return '-';
-    const d = new Date(iso);
-    return d.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    // 백엔드 UTC 저장 -> Z 없으면 UTC로 간주 후 한국 시간(KST) 표시
+    const utcStr = /[Z+-]\d{2}:?\d{2}$/.test(iso) ? iso : iso + 'Z';
+    const d = new Date(utcStr);
+    return d.toLocaleTimeString('ko-KR', {
+      timeZone: 'Asia/Seoul',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
   };
 
   return (
-    <div className="bg-gray-800 p-6 rounded-xl shadow-lg h-full">
-      <h3 className="text-lg font-medium text-gray-200 border-b border-gray-700 pb-3 mb-4">매매 로그</h3>
-      <div className="space-y-3 overflow-y-auto h-[calc(100%-40px)]">
+    <div className="bg-gray-800 p-6 rounded-xl shadow-lg flex flex-col min-h-0 max-h-[420px] shrink-0">
+      <h3 className="text-lg font-medium text-gray-200 border-b border-gray-700 pb-3 mb-4 shrink-0">매매 로그</h3>
+      <div className="space-y-3 overflow-y-auto flex-1 min-h-0">
         {isLoading ? (
           <p className="text-gray-400 text-sm">불러오는 중…</p>
         ) : trades.length === 0 ? (

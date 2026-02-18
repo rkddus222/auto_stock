@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { apiClient } from '../api/client';
+import { symbolNames } from '../constants/stockMap';
 
 interface PositionDetail {
   symbol: string;
@@ -57,7 +58,7 @@ const PositionsTable = () => {
             const isProfit = p.unrealizedPL >= 0;
             return (
               <tr key={p.symbol} className="border-b border-gray-700">
-                <td className="py-2 pr-4 font-medium text-gray-200">{p.symbol}</td>
+                <td className="py-2 pr-4 font-medium text-gray-200">{symbolNames[p.symbol] ?? p.symbol}</td>
                 <td className="py-2 pr-4 text-gray-300">{p.quantity}</td>
                 <td className="py-2 pr-4 text-gray-300">{formatCurrency(p.purchasePrice)}</td>
                 <td className="py-2 pr-4 text-gray-300">{formatCurrency(p.currentPrice)}</td>

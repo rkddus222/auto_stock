@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiClient } from '../api/client';
+import { symbolNames } from '../constants/stockMap';
 import { useState, useEffect, useRef } from 'react';
 
 interface StrategySchema {
@@ -130,7 +131,7 @@ function SymbolStrategyForm({
   return (
     <div className="border border-gray-700 rounded-lg p-4">
       <div className="flex flex-wrap items-center gap-4 mb-3">
-        <span className="font-medium text-gray-200">{symbol}</span>
+        <span className="font-medium text-gray-200">{symbolNames[symbol] ?? symbol}</span>
         <select
           className="bg-gray-700 text-gray-200 rounded px-3 py-1.5"
           value={effectiveStrategy}

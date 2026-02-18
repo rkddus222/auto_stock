@@ -12,6 +12,7 @@ import { useWebSocket } from '../hooks/useWebSocket';
 interface StatusData {
   totalAssets: number;
   cashBalance: number;
+  holdingsValue: number;
   todayRealizedPL: number;
   returnRate: number;
   tradingEnabled: boolean;
@@ -49,6 +50,8 @@ const Dashboard = () => {
 
   const displayData = statusData ?? {
     totalAssets: 0,
+    cashBalance: 0,
+    holdingsValue: 0,
     todayRealizedPL: 0,
     returnRate: 0,
     tradingEnabled: false,
@@ -82,14 +85,23 @@ const Dashboard = () => {
           </span>
         </header>
 
-        {/* Main Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Main Grid - items-start로 각 컬럼 높이 독립 */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
           <div className="lg:col-span-2 space-y-6">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <StatusCard
+                title="현금 (예수금)"
+                value={isLoading ? '…' : hasAssetsError ? '조회 실패' : `₩${formatCurrency(displayData.cashBalance ?? 0)}`}
+                subtitle={hasAssetsError ? displayData.assetsError : undefined}
+              />
+              <StatusCard
+                title="보유 주식"
+                value={isLoading ? '…' : hasAssetsError ? '-' : `₩${formatCurrency(displayData.holdingsValue ?? 0)}`}
+              />
               <StatusCard
                 title="총 자산"
-                value={isLoading ? '…' : hasAssetsError ? '조회 실패' : `₩${formatCurrency(displayData.totalAssets)}`}
-                subtitle={hasAssetsError ? displayData.assetsError : undefined}
+                value={isLoading ? '…' : hasAssetsError ? '-' : `₩${formatCurrency((displayData.cashBalance ?? 0) + (displayData.holdingsValue ?? 0))}`}
+                subtitle="현금 + 보유 주식 (매수 시 현금 ↓·보유 ↑, 합계 동일)"
               />
               <StatusCard
                 title="당일 실현 손익"

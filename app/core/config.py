@@ -16,6 +16,7 @@ class Settings(BaseSettings):
 
     # Strategy settings
     VOLATILITY_BREAKOUT_K: float = 0.5
+    USE_ADAPTIVE_K: bool = True   # 변동성 돌파 전략에서 전일 변동성 기반 K 적용
     # 매매 시 예수금의 몇 %를 사용할지 (0~1, 예: 0.5 = 50%)
     BUDGET_RATIO: float = 0.5
     # 대상 종목 코드 (쉼표 구분, 예: "005930,000660"). 조건검색 미사용 시에만 사용
@@ -39,6 +40,27 @@ class Settings(BaseSettings):
     # 빈 자리 채우기: 최대 동시 보유 종목 수, 자리 비었을 때 재검색 간격(초)
     MAX_SLOTS: int = 3          # 최대 N종목까지 동시 보유 (자금 관리)
     SCAN_INTERVAL: int = 60     # 빈 자리 발견 시 이 간격(초)마다만 API 재호출 (과다 호출 방지)
+
+    # 진입 필터: 시간(분), 갭업(%), 거래량 비율 (0=미적용)
+    ENTRY_NO_BEFORE_MINUTE: int = 30   # 이 시간(분) 전에는 신규 매수 금지 (09:XX → 30 = 09:30 이후만)
+    ENTRY_NO_AFTER_HOUR: int = 14      # 이 시각 이후에는 신규 매수 금지 (14 = 14:00, 14:30은 14+30/60으로 별도)
+    ENTRY_NO_AFTER_MINUTE: int = 30    # 14:30 = ENTRY_NO_AFTER_HOUR 14, ENTRY_NO_AFTER_MINUTE 30
+    ENTRY_GAP_UP_PCT: float = 5.0      # 당일 시가가 전일 종가 대비 이 비율 이상 갭업이면 진입 스킵 (0=미적용)
+    ENTRY_VOLUME_RATIO: float = 1.5    # 돌파 시점 거래량 >= 직전 20봉 평균 * 이 값일 때만 진입 (0=미적용)
+
+    # 일별 리스크 관리
+    DAILY_LOSS_LIMIT_PCT: float = -2.0   # 당일 실현손실이 총자산 대비 이 % 이하면 신규 매수 중단
+    MAX_CONSECUTIVE_LOSSES: int = 3      # 이 횟수 연패 시 다음 매수 예산 축소
+    BUDGET_CUT_ON_STREAK: float = 0.5    # 연패 시 적용할 예산 비율 (0.5 = 50%)
+    MAX_DAILY_TRADES: int = 6            # 당일 체결 건수(BUY+SELL) 이하면 신규 매수 허용 (초과 시 신규 매수만 중단)
+
+    # ATR 손절 (변동성 돌파 전략)
+    USE_ATR_STOP: bool = False          # True 시 ATR 기반 손절, False 시 기존 trailing_stop_pct
+    ATR_PERIOD: int = 20
+    ATR_MULTIPLIER: float = 1.5
+
+    # 종목 스코어링 (동적 종목 사용 시 상위 N개만 진입)
+    USE_STOCK_SCORING: bool = False      # True 시 후보를 스코어로 정렬 후 상위 MAX_SLOTS만
 
     # 데이터/상태 파일 기준 디렉터리 (비우면 프로젝트 루트)
     DATA_DIR: str = ""
