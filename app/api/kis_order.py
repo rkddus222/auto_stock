@@ -70,7 +70,52 @@ def place_order(symbol: str, quantity: int, price: int, order_type: str):
             logger.debug(f'주문 성공: {res["msg1"]}')
             return res
         else:
-            raise OrderError(f'주문 실패: {res["msg1"]}')
+            msg1 = res.get("msg1", "주문 실패")
+            try:
+                path_balance = "/uapi/domestic-stock/v1/trading/inquire-balance"
+                url_balance = f"{kis_auth.base_url}{path_balance}"
+                cano, acnt_prdt_cd = _get_account_parts()
+                headers_balance = {
+                    "Content-Type": "application/json",
+                    "authorization": f"Bearer {kis_auth.access_token}",
+                    "appKey": kis_auth._app_key,
+                    "appSecret": kis_auth._app_secret,
+                    "tr_id": _balance_tr_id(),
+                }
+                base_params = {
+                    "CANO": cano,
+                    "ACNT_PRDT_CD": acnt_prdt_cd,
+                    "AFHR_FLPR_YN": "N",
+                    "OFL_YN": "",
+                    "UNPR_DVSN": "01",
+                    "FUND_STTL_ICLD_YN": "N",
+                    "FNCG_AMT_AUTO_RDPT_YN": "N",
+                    "PRCS_DVSN": "01",
+                    "CTX_AREA_FK100": "",
+                    "CTX_AREA_NK100": "",
+                }
+                bal = None
+                for inqr_dvsn in ("02", "01"):  # 02=요약(계좌 전체), 01=주식별; 요약이 더 정확할 수 있음
+                    params_balance = {**base_params, "INQR_DVSN": inqr_dvsn}
+                    resp = kis_get(url_balance, headers=headers_balance, params=params_balance)
+                    bal = resp.json()
+                    if bal.get("rt_cd") == "0":
+                        break
+                price_str = f"{price:,}원" if price and price > 0 else "시장가"
+                side = "매수" if order_type == "BUY" else "매도"
+                if bal and bal.get("rt_cd") == "0":
+                    summary = _parse_balance_summary(bal)
+                    logger.warning(
+                        f"주문 실패: {msg1}. 주문 시도: {symbol} {quantity}주 @ {price_str} ({side}). "
+                        f"예수금: {summary['deposit']:,}원, 주문가능금액({summary['orderable_source']}): {summary['orderable']:,}원"
+                    )
+                else:
+                    logger.warning(f"주문 실패: {msg1}. 주문 시도: {symbol} {quantity}주 @ {price_str} ({side}). (잔고 조회 실패)")
+            except Exception as e2:
+                price_str = f"{price:,}원" if price and price > 0 else "시장가"
+                side = "매수" if order_type == "BUY" else "매도"
+                logger.warning(f"주문 실패: {msg1}. 주문 시도: {symbol} {quantity}주 @ {price_str} ({side}). 잔고 조회 중 오류: {e2}")
+            raise OrderError(f'주문 실패: {msg1}')
     except (OrderError, APIRequestError):
         raise
     except Exception as e:
@@ -129,6 +174,47 @@ def _parse_cash_from_balance_response(res: dict) -> int:
     row = out2[0]
     amt = row.get("dnca_tot_amt") or row.get("tot_evlu_amt") or row.get("prvs_rcdl_excc_amt") or "0"
     return int(amt)
+
+
+def _parse_orderable_from_balance_response(res: dict) -> int:
+    """잔고조회 응답에서 주문가능금액(ord_psbl_cash) 또는 예수금을 추출. output2가 비어 있으면 0 반환."""
+    summary = _parse_balance_summary(res)
+    return summary["orderable"]
+
+
+# 잔고 output2에서 주문가능금액: ord_psbl_cash(주문가능현금) = 주문 가능한 원화 (KIS inquire-balance)
+_ORDERABLE_KEYS = (
+    "ord_psbl_cash",  # 주문가능현금 (주문 가능 원화)
+    "ord_psbl_won",
+    "ord_psbl_amt",
+    "ord_psbl_krw",
+)
+
+
+def _parse_balance_summary(res: dict) -> dict:
+    """
+    잔고조회 output2에서 예수금·주문가능금액을 추출.
+    주문가능원화(ord_psbl_won) 등 후보 필드를 순서대로 시도.
+    반환: {"deposit": 예수금총금액, "orderable": 주문가능금액, "orderable_source": 사용한 필드명}
+    """
+    out2 = res.get("output2")
+    if not out2 or not isinstance(out2, list) or len(out2) == 0:
+        return {"deposit": 0, "orderable": 0, "orderable_source": "없음"}
+    row = out2[0]
+    logger.debug(f"잔고 output2[0] 필드: {list(row.keys())}")
+    deposit = int(row.get("dnca_tot_amt") or row.get("tot_evlu_amt") or row.get("prvs_rcdl_excc_amt") or "0")
+    orderable = deposit
+    source = "dnca_tot_amt(예수금)"
+    for key in _ORDERABLE_KEYS:
+        val = row.get(key)
+        if val is not None and str(val).strip() != "":
+            try:
+                orderable = int(val)
+                source = key
+                break
+            except (TypeError, ValueError):
+                continue
+    return {"deposit": deposit, "orderable": orderable, "orderable_source": source}
 
 
 @kis_retry

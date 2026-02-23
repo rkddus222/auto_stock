@@ -1,16 +1,18 @@
 import { useState } from 'react';
-import { AlertTriangle } from 'lucide-react';
+import { AlertTriangle, RefreshCw } from 'lucide-react';
 
 interface ControlPanelProps {
   tradingEnabled: boolean;
   onToggle: () => Promise<void>;
   onPanicSell: () => Promise<void>;
+  onSyncPositions?: () => Promise<void>;
 }
 
-const ControlPanel = ({ tradingEnabled, onToggle, onPanicSell }: ControlPanelProps) => {
+const ControlPanel = ({ tradingEnabled, onToggle, onPanicSell, onSyncPositions }: ControlPanelProps) => {
   const [showPanicModal, setShowPanicModal] = useState(false);
   const [toggleLoading, setToggleLoading] = useState(false);
   const [panicLoading, setPanicLoading] = useState(false);
+  const [syncLoading, setSyncLoading] = useState(false);
 
   const handleToggleBot = async () => {
     setToggleLoading(true);
@@ -59,6 +61,23 @@ const ControlPanel = ({ tradingEnabled, onToggle, onPanicSell }: ControlPanelPro
           <AlertTriangle className="mr-2 h-5 w-5" />
           전량 매도 (Panic)
         </button>
+        {onSyncPositions && (
+          <button
+            onClick={async () => {
+              setSyncLoading(true);
+              try {
+                await onSyncPositions();
+              } finally {
+                setSyncLoading(false);
+              }
+            }}
+            disabled={syncLoading}
+            className="w-full bg-gray-600 hover:bg-gray-500 disabled:opacity-60 text-white font-medium py-2.5 px-4 rounded-lg flex items-center justify-center transition-colors duration-200"
+          >
+            <RefreshCw className={`mr-2 h-4 w-4 ${syncLoading ? 'animate-spin' : ''}`} />
+            포지션 동기화 (KIS 잔고 기준)
+          </button>
+        )}
       </div>
 
       {showPanicModal && (

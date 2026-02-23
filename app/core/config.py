@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     ENTRY_NO_AFTER_HOUR: int = 14      # 이 시각 이후에는 신규 매수 금지 (14 = 14:00, 14:30은 14+30/60으로 별도)
     ENTRY_NO_AFTER_MINUTE: int = 30    # 14:30 = ENTRY_NO_AFTER_HOUR 14, ENTRY_NO_AFTER_MINUTE 30
     ENTRY_GAP_UP_PCT: float = 5.0      # 당일 시가가 전일 종가 대비 이 비율 이상 갭업이면 진입 스킵 (0=미적용)
+    ENTRY_MAX_UP_FROM_OPEN_PCT: float = 30.0  # 당일 시가 대비 현재가가 이 비율 이상 상승했으면 진입 스킵 (상친거 매수 방지, 0=미적용)
     ENTRY_VOLUME_RATIO: float = 1.5    # 돌파 시점 거래량 >= 직전 20봉 평균 * 이 값일 때만 진입 (0=미적용)
 
     # 일별 리스크 관리

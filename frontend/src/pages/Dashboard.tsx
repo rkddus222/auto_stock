@@ -127,6 +127,11 @@ const Dashboard = () => {
                 await queryClient.invalidateQueries({ queryKey: ['status'] });
                 await queryClient.invalidateQueries({ queryKey: ['trades'] });
               }}
+              onSyncPositions={async () => {
+                const { data } = await apiClient.post<{ success: boolean; message: string; cleared: string[] }>('/api/sync-positions');
+                await queryClient.invalidateQueries({ queryKey: ['status'] });
+                showToast(data.success ? 'success' : 'info', data.message ?? '동기화 완료');
+              }}
             />
             <StrategySettings />
             <TradeHistory />

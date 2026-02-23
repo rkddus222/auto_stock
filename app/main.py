@@ -18,6 +18,7 @@ try:
     import asyncio
     from fastapi import FastAPI, WebSocket
     from fastapi.middleware.cors import CORSMiddleware
+    from pydantic import BaseModel
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
 except ModuleNotFoundError as e:
     print("필요한 패키지가 없습니다. 프로젝트 루트(auto_stock)에서 아래를 실행하세요:", file=sys.stderr)
@@ -486,6 +487,20 @@ def _run_trading_strategy_impl():
                     continue
                 signal, price_at_signal = strategy.check_signal(symbol)
                 if signal == "BUY" and price_at_signal is not None:
+                    # 상친거(시가 대비 N% 이상 상승) 매수 방지
+                    max_up_pct = getattr(settings, "ENTRY_MAX_UP_FROM_OPEN_PCT", 30.0) or 0
+                    if max_up_pct > 0:
+                        try:
+                            daily = kis_market.get_daily_ohlcv(symbol, days=1)
+                            if daily and len(daily) > 0:
+                                today_open = float(daily[0].get("stck_oprc") or 0)
+                                if today_open > 0 and price_at_signal >= today_open * (1 + max_up_pct / 100):
+                                    logger.debug(f"[{symbol}] 매수 스킵: 시가 대비 {max_up_pct}% 이상 상승 (시가={today_open:.0f}, 현재가={price_at_signal:.0f})")
+                                    time.sleep(0.2)
+                                    continue
+                        except Exception as e:
+                            logger.debug(f"[{symbol}] 시가 조회 실패, 상승률 필터 스킵: {e}")
+
                     quantity_to_buy = int(budget_per_stock // price_at_signal)
                     if quantity_to_buy < 1:
                         logger.debug(f"[{symbol}] 매수 스킵: 예산 부족 (종목당 예산으로 1주 미만)")
@@ -527,6 +542,40 @@ def _run_trading_strategy_impl():
 
         except Exception as e:
             logger.error(f"[{symbol}] 매매 로직 실행 중 에러: {e}")
+
+
+def sell_symbol(symbol: str, quantity: int | None = None) -> dict:
+    """
+    특정 종목을 개별 매도합니다. quantity가 없거나 0이면 전량 매도.
+    :return: {"success": bool, "message": str, "sold_quantity": int or 0}
+    """
+    st = trade_status.get(symbol)
+    if not st or not st.get("bought"):
+        return {"success": False, "message": f"{symbol} 보유 종목이 아닙니다.", "sold_quantity": 0}
+    held = st["quantity"]
+    if held <= 0:
+        return {"success": False, "message": f"{symbol} 보유 수량이 없습니다.", "sold_quantity": 0}
+    sell_qty = (quantity if quantity and quantity > 0 else held)
+    sell_qty = min(sell_qty, held)
+    purchase_price = st.get("purchase_price", 0) or 0
+    try:
+        current_price = kis_market.get_current_price(symbol)
+        res = kis_order.place_order(symbol=symbol, quantity=sell_qty, price=0, order_type="SELL")
+        pl = (current_price - purchase_price) * sell_qty if purchase_price else 0.0
+        _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.EXECUTED, res, realized_pl=pl)
+        send_slack_notification(f"[개별 매도] {symbol}, 수량: {sell_qty}, 현재가: {current_price:.0f}")
+        remaining = held - sell_qty
+        if remaining <= 0:
+            trade_status[symbol] = {"bought": False, "purchase_price": 0.0, "quantity": 0, "stop_price": 0.0}
+        else:
+            trade_status[symbol]["quantity"] = remaining
+        save_trade_status()
+        queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": sell_qty})
+        return {"success": True, "message": f"{symbol} {sell_qty}주 매도 체결", "sold_quantity": sell_qty}
+    except Exception as e:
+        _log_trade(symbol, "SELL", 0.0, sell_qty, OrderStatus.FAILED, None)
+        logger.error(f"[{symbol}] 개별 매도 실패: {e}")
+        return {"success": False, "message": str(e), "sold_quantity": 0}
 
 
 def sell_all_at_close():
@@ -831,6 +880,29 @@ def api_panic_sell():
     """전량 매도 (Panic Sell)"""
     sell_all_at_close()
     return {"success": True, "message": "전량 매도 주문을 실행했습니다."}
+
+
+class SellRequest(BaseModel):
+    symbol: str
+    quantity: int | None = None  # 없거나 0이면 전량 매도
+
+
+@app.post("/api/sell")
+def api_sell(body: SellRequest):
+    """개별 종목 매도 (전량 또는 지정 수량)"""
+    result = sell_symbol(body.symbol, body.quantity)
+    return result
+
+
+@app.post("/api/sync-positions")
+def api_sync_positions():
+    """KIS 실제 잔고 기준으로 보유 목록 동기화 (잔고 없는 종목은 보유에서 제거)"""
+    cleared = reconciliation_service.sync_positions_from_kis(trade_status)
+    return {
+        "success": True,
+        "cleared": cleared,
+        "message": f"동기화 완료. 보유 해제된 종목: {len(cleared)}건" + (f" ({', '.join(cleared)})" if cleared else ""),
+    }
 
 
 # 라우터 등록 (전략/포트폴리오 API)
