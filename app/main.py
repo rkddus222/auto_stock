@@ -52,9 +52,76 @@ _pending_broadcasts: list[dict] = []
 _broadcast_lock = threading.Lock()
 # 매매 job 중복 실행 방지: job은 10초마다 호출되지만, 실제 로직은 한 번에 하나만 실행
 _trading_job_lock = threading.Lock()
+# 매수 실패 시 종목별 쿨다운 (symbol -> 쿨다운 만료 시각 epoch)
+_buy_cooldown: dict[str, float] = {}
+_BUY_COOLDOWN_SECONDS = 300  # 5분
 
 DEFAULT_STRATEGY_NAME = "volatility_breakout"
 DEFAULT_STRATEGY_PARAMS = {"ma_period": 20, "trailing_stop_pct": 4.0, "k": getattr(settings, "VOLATILITY_BREAKOUT_K", 0.5)}
+
+# 지수 필터 캐시 (매 사이클마다 API 호출 방지, 60초 유효)
+_market_filter_cache: dict = {"ok": True, "ts": 0.0, "reason": ""}
+_MARKET_FILTER_TTL = 60  # 초
+
+
+def _get_tick_size(price: float) -> int:
+    """한국 주식 호가 단위를 반환합니다."""
+    if price < 2000:
+        return 1
+    elif price < 5000:
+        return 5
+    elif price < 20000:
+        return 10
+    elif price < 50000:
+        return 50
+    elif price < 200000:
+        return 100
+    elif price < 500000:
+        return 500
+    else:
+        return 1000
+
+
+def _calc_buy_limit_price(current_price: float, tick_offset: int = 2) -> int:
+    """현재가 + N호가 지정가를 계산합니다. tick_offset=0이면 0 반환(시장가)."""
+    if tick_offset <= 0:
+        return 0
+    tick = _get_tick_size(current_price)
+    return int(current_price + tick * tick_offset)
+
+
+def _check_market_filter() -> tuple[bool, str]:
+    """시장 지수 필터: 지수가 MA 아래면 (False, 사유) 반환. 캐시 적용."""
+    if not getattr(settings, "USE_MARKET_FILTER", False):
+        return True, ""
+    now_ts = time.time()
+    if now_ts - _market_filter_cache["ts"] < _MARKET_FILTER_TTL:
+        return _market_filter_cache["ok"], _market_filter_cache["reason"]
+    try:
+        index_code = getattr(settings, "MARKET_INDEX_CODE", "1001")
+        ma_period = getattr(settings, "MARKET_MA_PERIOD", 5)
+        index_price = kis_market.get_index_price(index_code)
+        daily = kis_market.get_index_daily(index_code, days=ma_period + 1)
+        if daily and len(daily) >= ma_period:
+            closes = []
+            for d in daily[:ma_period]:
+                val = d.get("bstp_nmix_prpr") or d.get("bstp_nmix_clpr") or d.get("stck_clpr")
+                if val:
+                    closes.append(float(val))
+            if len(closes) >= ma_period:
+                ma = sum(closes) / len(closes)
+                index_name = "코스닥" if index_code == "1001" else "코스피"
+                if index_price < ma:
+                    reason = f"{index_name} {index_price:.1f} < MA{ma_period} {ma:.1f}"
+                    _market_filter_cache.update(ok=False, ts=now_ts, reason=reason)
+                    return False, reason
+                else:
+                    _market_filter_cache.update(ok=True, ts=now_ts, reason="")
+                    return True, ""
+    except Exception as e:
+        logger.debug(f"시장 지수 필터 조회 실패 (통과 처리): {e}")
+    _market_filter_cache.update(ok=True, ts=now_ts, reason="")
+    return True, ""
 
 
 def _is_trading_session() -> bool:
@@ -74,8 +141,8 @@ def _is_trading_session() -> bool:
 
 def _is_entry_allowed_time() -> bool:
     """
-    신규 매수 허용 시간 여부. 장 운영 시간이어도 09:00~09:30, 14:30~15:20 구간에서는 신규 매수 금지.
-    - 09:30 이후 ~ 14:30 미만일 때만 True
+    신규 매수 허용 시간 여부 (설정값 기반).
+    - 09:{ENTRY_NO_BEFORE_MINUTE} 이후 ~ {ENTRY_NO_AFTER_HOUR}:{ENTRY_NO_AFTER_MINUTE} 미만일 때만 True
     """
     KST = timezone(timedelta(hours=9))
     now = datetime.now(KST)
@@ -130,6 +197,14 @@ def load_trade_status():
     except (FileNotFoundError, json.JSONDecodeError):
         trade_status = {}
         logger.warning("거래 상태 파일을 찾을 수 없어 새로 생성합니다.")
+
+    # P7: 미보유 종목이 20개 초과 시 일괄 제거 (누적 방지)
+    non_holding = [s for s, st in trade_status.items() if not st.get("bought")]
+    if len(non_holding) > 20:
+        for s in non_holding:
+            del trade_status[s]
+        logger.info(f"trade_status 정리: 미보유 {len(non_holding)}건 제거")
+        save_trade_status()
 
     holding = [s for s, st in trade_status.items() if st.get("bought")]
     if settings.USE_VOLUME_RANK:
@@ -196,8 +271,11 @@ def _get_today_pl_and_assets():
         return today_pl, None
 
 
-def _get_consecutive_losses() -> int:
-    """최근 매도 체결부터 연속 손실 횟수를 반환합니다."""
+def _get_recent_trade_stats(window: int = 10) -> tuple[int, int, int]:
+    """최근 매도 거래 분석: (연속 손실 횟수, 윈도우 내 승수, 윈도우 내 패수) 반환.
+    연속 손실: 가장 최근 거래부터 연속으로 손실인 횟수.
+    승/패: 윈도우(기본 10건) 내 전체 승패 카운트 (복구 판단용).
+    """
     db = session.SessionLocal()
     try:
         rows = (
@@ -207,18 +285,22 @@ def _get_consecutive_losses() -> int:
                 models.TradeLog.status == OrderStatus.EXECUTED,
             )
             .order_by(models.TradeLog.timestamp.desc())
-            .limit(20)
+            .limit(window)
             .all()
         )
-        count = 0
-        for r in rows:
+        consecutive = 0
+        wins = 0
+        losses = 0
+        for i, r in enumerate(rows):
             if (r.realized_pl or 0) < 0:
-                count += 1
+                losses += 1
+                if i == consecutive:  # 아직 연속 손실 중
+                    consecutive += 1
             else:
-                break
-        return count
+                wins += 1
+        return consecutive, wins, losses
     except Exception:
-        return 0
+        return 0, 0, 0
     finally:
         db.close()
 
@@ -353,12 +435,35 @@ def _run_trading_strategy_impl():
             no_new_buy = True
             logger.debug(f"일일 매매 횟수 한도 ({today_trades} >= {max_trades}) → 신규 매수 중단")
     if not no_new_buy:
-        consecutive = _get_consecutive_losses()
-        max_streak = getattr(settings, "MAX_CONSECUTIVE_LOSSES", 3) or 0
-        cut = getattr(settings, "BUDGET_CUT_ON_STREAK", 0.5) or 1.0
-        if max_streak > 0 and consecutive >= max_streak and cut < 1.0:
-            budget_per_stock *= cut
-            logger.info(f"연패 {consecutive}회 → 매수 예산 {cut*100:.0f}% 적용")
+        consec_losses, recent_wins, recent_losses = _get_recent_trade_stats(10)
+        max_streak = getattr(settings, "MAX_CONSECUTIVE_LOSSES", 4) or 0
+        max_slots_orig = settings.MAX_SLOTS or 3
+        budget_cut_ratio = getattr(settings, "BUDGET_CUT_ON_STREAK", 0.7)
+        total_recent = recent_wins + recent_losses
+        win_rate = recent_wins / max(1, total_recent)
+
+        if max_streak > 0 and consec_losses >= max_streak:
+            # Level 2 (SEVERE): 활성 연패 중 → 슬롯 절반 + 예산 축소
+            reduced_slots = max(1, max_slots_orig // 2)
+            if current_holdings >= reduced_slots:
+                no_new_buy = True
+                logger.info(f"[리스크 Lv2] 연패 {consec_losses}회 → 슬롯 {max_slots_orig}→{reduced_slots}, 보유 {current_holdings}개 → 매수 중단")
+            else:
+                open_slots = max(1, reduced_slots - current_holdings)
+                budget_per_stock = (cash_balance * ratio * budget_cut_ratio) / open_slots
+                logger.info(f"[리스크 Lv2] 연패 {consec_losses}회 → 슬롯 {max_slots_orig}→{reduced_slots}, 예산 ×{budget_cut_ratio}")
+        elif max_streak > 0 and total_recent >= 3 and win_rate < 0.4:
+            # Level 1 (CAUTION): 연패 끊었지만 최근 10건 승률 40% 미만 → 슬롯 3/4
+            reduced_slots = max(1, max_slots_orig * 3 // 4)
+            if current_holdings >= reduced_slots:
+                no_new_buy = True
+                logger.info(f"[리스크 Lv1] 최근 승률 {win_rate:.0%} ({recent_wins}W/{total_recent}) → 슬롯 {max_slots_orig}→{reduced_slots}, 매수 중단")
+            else:
+                open_slots = max(1, reduced_slots - current_holdings)
+                budget_per_stock = (cash_balance * ratio) / open_slots
+                logger.info(f"[리스크 Lv1] 최근 승률 {win_rate:.0%} ({recent_wins}W/{total_recent}) → 슬롯 {max_slots_orig}→{reduced_slots}")
+        else:
+            logger.debug(f"[리스크 Lv0] 정상 (최근 {recent_wins}W {recent_losses}L, 연패 {consec_losses})")
 
     for symbol in target_symbols:
         try:
@@ -374,13 +479,22 @@ def _run_trading_strategy_impl():
                 # 3단계 익절: +5% 1/3 매도+본절 이동, +10% 추가 1/3 매도, 나머지 트레일링
                 purchase_price = trade_status[symbol].get("purchase_price", 0) or 0
                 initial_quantity = trade_status[symbol].get("initial_quantity", quantity)
+                # 최고가 추적 (트레일링/ATR 손절 기준점 — 현재가가 아닌 최고가 기준)
+                high_price = trade_status[symbol].get("high_price", purchase_price or current_price)
+                if current_price > high_price:
+                    high_price = current_price
+                    trade_status[symbol]["high_price"] = high_price
                 stage1_done = trade_status[symbol].get("stage1_sell_done", False)
                 stage2_done = trade_status[symbol].get("stage2_sell_done", False)
                 if purchase_price <= 0:
                     pass
+                elif initial_quantity < 3:
+                    # 보유 수량이 3주 미만이면 단계 익절 불가 → 트레일링 스톱에 맡김
+                    if not stage1_done:
+                        logger.debug(f"[{symbol}] 보유 {initial_quantity}주 → 단계 익절 스킵 (트레일링 스톱 유지)")
                 elif not stage1_done and current_price >= purchase_price * 1.05:
                     # +5%: 1/3 매도 + 스톱 본절로 이동
-                    sell_qty = max(0, initial_quantity // 3)
+                    sell_qty = initial_quantity // 3
                     if sell_qty > 0 and quantity >= sell_qty:
                         try:
                             res = kis_order.place_order(symbol=symbol, quantity=sell_qty, price=0, order_type="SELL")
@@ -402,7 +516,7 @@ def _run_trading_strategy_impl():
                     continue
                 elif stage1_done and not stage2_done and current_price >= purchase_price * 1.10:
                     # +10%: 추가 1/3 매도
-                    sell_qty = max(0, initial_quantity // 3)
+                    sell_qty = initial_quantity // 3
                     remaining = trade_status[symbol]["quantity"]
                     sell_qty = min(sell_qty, remaining)
                     if sell_qty > 0:
@@ -423,39 +537,51 @@ def _run_trading_strategy_impl():
                     time.sleep(0.2)
                     continue
 
-                # 전략 SELL 신호 확인
-                signal, _ = strategy.check_signal(symbol)
+                # 전략 SELL 신호 확인 (RSI 과매수)
+                signal, _ = strategy.check_signal(symbol, current_price=current_price)
                 if signal == "SELL":
-                    logger.info(f"[{symbol}] 전략 매도 신호 실행")
-                    try:
-                        res = kis_order.place_order(symbol=symbol, quantity=quantity, price=0, order_type="SELL")
-                        pl = (current_price - purchase_price) * quantity
-                        _log_trade(symbol, "SELL", current_price, quantity, OrderStatus.EXECUTED, res, realized_pl=pl)
-                        send_slack_notification(f"[전략 매도] {symbol} ({quantity}주) | 현재가: {current_price:.0f}")
-                        trade_status[symbol] = {"bought": False, "purchase_price": 0.0, "quantity": 0, "stop_price": 0.0}
-                        save_trade_status()
-                        queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": quantity})
-                    except Exception as e:
-                        _log_trade(symbol, "SELL", current_price, quantity, OrderStatus.FAILED, None)
-                        logger.error(f"[{symbol}] 매도 주문 실패: {e}")
-                    time.sleep(0.2)
-                    continue
+                    if initial_quantity < 3:
+                        # 소량 보유 → 전량 매도 (단계 익절 불가한 포지션)
+                        logger.info(f"[{symbol}] RSI 매도 ({quantity}주 전량)")
+                        try:
+                            res = kis_order.place_order(symbol=symbol, quantity=quantity, price=0, order_type="SELL")
+                            pl = (current_price - purchase_price) * quantity
+                            _log_trade(symbol, "SELL", current_price, quantity, OrderStatus.EXECUTED, res, realized_pl=pl)
+                            send_slack_notification(f"[RSI 매도] {symbol} ({quantity}주) | 현재가: {current_price:.0f}")
+                            trade_status[symbol] = {"bought": False, "purchase_price": 0.0, "quantity": 0, "stop_price": 0.0}
+                            save_trade_status()
+                            queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": quantity})
+                        except Exception as e:
+                            _log_trade(symbol, "SELL", current_price, quantity, OrderStatus.FAILED, None)
+                            logger.error(f"[{symbol}] 매도 주문 실패: {e}")
+                        time.sleep(0.2)
+                        continue
+                    else:
+                        # 다량 보유 → 트레일링 타이트닝 (추세추종 유지, 전량매도 대신 손절폭 절반 축소)
+                        tight_stop = high_price * (1 - trailing_pct / 200)
+                        if tight_stop > trade_status[symbol]["stop_price"]:
+                            trade_status[symbol]["stop_price"] = tight_stop
+                            logger.info(f"[{symbol}] RSI 과매수 → 트레일링 타이트닝 (손절가 {tight_stop:.0f}, 최고가 {high_price:.0f})")
+                            save_trade_status()
+                        time.sleep(0.2)
+                        continue
 
-                # 손절 조건 확인 (트레일링 스톱 또는 ATR 기반)
+                # 손절 조건 확인 (ATR 기반 또는 트레일링 스톱)
                 use_atr = getattr(settings, "USE_ATR_STOP", False) or strategy.get_parameters().get("use_atr_stop", False)
                 atr_mult = getattr(settings, "ATR_MULTIPLIER", 1.5)
                 if use_atr and trade_status[symbol].get("atr") is not None:
                     atr = trade_status[symbol]["atr"]
-                    atr_floor = current_price - atr * atr_mult
-                    if current_price <= atr_floor:
-                        stop_price = atr_floor  # ATR 기준 손절가로 비교
+                    atr_floor = high_price - atr * atr_mult
+                    if atr_floor > stop_price:
+                        stop_price = atr_floor
                 if current_price <= stop_price:
-                    logger.info(f"[{symbol}] 트레일링 스톱 매도! 현재가: {current_price}, 손절가: {stop_price}")
+                    stop_type = "ATR 손절" if (not stage1_done and use_atr) else "트레일링 스톱"
+                    logger.info(f"[{symbol}] {stop_type} 매도! 현재가: {current_price}, 손절가: {stop_price}")
                     try:
                         res = kis_order.place_order(symbol=symbol, quantity=quantity, price=0, order_type="SELL")
                         pl = (current_price - purchase_price) * quantity
                         _log_trade(symbol, "SELL", current_price, quantity, OrderStatus.EXECUTED, res, realized_pl=pl)
-                        send_slack_notification(f"[트레일링 스톱] {symbol} ({quantity}주) | 현재가: {current_price:.0f}")
+                        send_slack_notification(f"[{stop_type}] {symbol} ({quantity}주) | 현재가: {current_price:.0f}")
                         trade_status[symbol] = {"bought": False, "purchase_price": 0.0, "quantity": 0, "stop_price": 0.0}
                         save_trade_status()
                         queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": quantity})
@@ -464,16 +590,27 @@ def _run_trading_strategy_impl():
                         logger.error(f"[{symbol}] 매도 주문 실패: {e}")
                     continue
 
-                # 트레일링 스톱 가격 상향 조정 (ATR 사용 시 floor 적용)
-                new_stop_price = current_price * (1 - trailing_pct / 100)
-                if use_atr and trade_status[symbol].get("atr") is not None:
-                    atr = trade_status[symbol]["atr"]
-                    atr_floor = current_price - atr * atr_mult
-                    new_stop_price = max(new_stop_price, atr_floor)
-                if new_stop_price > stop_price:
-                    trade_status[symbol]["stop_price"] = new_stop_price
-                    logger.debug(f"[{symbol}] 스톱 가격 상향 조정 -> {new_stop_price:.0f}")
-                    save_trade_status()
+                # 트레일링 스톱 상향: stage1 전에는 ATR 손절만 유지, stage1 후에 트레일링 활성
+                if not stage1_done and initial_quantity >= 3:
+                    # stage1 전: ATR 손절가만 갱신 (최고가 기준, 상향만)
+                    if use_atr and trade_status[symbol].get("atr") is not None:
+                        atr = trade_status[symbol]["atr"]
+                        atr_stop = high_price - atr * atr_mult
+                        if atr_stop > stop_price:
+                            trade_status[symbol]["stop_price"] = atr_stop
+                            logger.debug(f"[{symbol}] stage1 전 ATR 손절가 상향 -> {atr_stop:.0f} (최고가 {high_price:.0f})")
+                            save_trade_status()
+                else:
+                    # stage1 후: 트레일링 스톱 활성 (최고가 기준, ATR floor 반영)
+                    new_stop_price = high_price * (1 - trailing_pct / 100)
+                    if use_atr and trade_status[symbol].get("atr") is not None:
+                        atr = trade_status[symbol]["atr"]
+                        atr_floor = high_price - atr * atr_mult
+                        new_stop_price = max(new_stop_price, atr_floor)
+                    if new_stop_price > stop_price:
+                        trade_status[symbol]["stop_price"] = new_stop_price
+                        logger.debug(f"[{symbol}] 트레일링 스톱 상향 -> {new_stop_price:.0f} (최고가 {high_price:.0f})")
+                        save_trade_status()
 
             # 2. 미매수 상태: 매수 신호 확인 (진입 허용 시간 + 일별 리스크 통과 시)
             else:
@@ -482,13 +619,30 @@ def _run_trading_strategy_impl():
                     time.sleep(0.2)
                     continue
                 if not _is_entry_allowed_time():
-                    logger.debug(f"[{symbol}] 매수 스킵: 진입 허용 시간 아님 (09:30~14:30만 허용)")
+                    logger.debug(f"[{symbol}] 매수 스킵: 진입 허용 시간 아님 (09:{settings.ENTRY_NO_BEFORE_MINUTE:02d}~{settings.ENTRY_NO_AFTER_HOUR}:{settings.ENTRY_NO_AFTER_MINUTE:02d})")
                     time.sleep(0.2)
                     continue
-                signal, price_at_signal = strategy.check_signal(symbol)
+                # 시장 지수 필터: 지수가 MA 아래면 매수 금지
+                market_ok, market_reason = _check_market_filter()
+                if not market_ok:
+                    logger.debug(f"[{symbol}] 매수 스킵: 시장 하락 ({market_reason})")
+                    time.sleep(0.2)
+                    continue
+                # 매수 쿨다운 체크 (이전 실패 후 5분 대기)
+                cooldown_until = _buy_cooldown.get(symbol, 0)
+                now_ts = time.time()
+                if now_ts < cooldown_until:
+                    logger.debug(f"[{symbol}] 매수 쿨다운 중 (남은 {cooldown_until - now_ts:.0f}초)")
+                    time.sleep(0.2)
+                    continue
+                # 만료된 쿨다운 정리
+                expired = [s for s, t in _buy_cooldown.items() if now_ts >= t]
+                for s in expired:
+                    del _buy_cooldown[s]
+                signal, price_at_signal = strategy.check_signal(symbol, current_price=current_price)
                 if signal == "BUY" and price_at_signal is not None:
-                    # 상친거(시가 대비 N% 이상 상승) 매수 방지
-                    max_up_pct = getattr(settings, "ENTRY_MAX_UP_FROM_OPEN_PCT", 30.0) or 0
+                    # 상친거(시가 대비 N% 이상 상승) 매수 방지 — 국장 상한가 30%이므로 기본 10% 초과 상승 시 진입 스킵
+                    max_up_pct = getattr(settings, "ENTRY_MAX_UP_FROM_OPEN_PCT", 10.0) or 0
                     if max_up_pct > 0:
                         try:
                             daily = kis_market.get_daily_ohlcv(symbol, days=1)
@@ -516,13 +670,16 @@ def _run_trading_strategy_impl():
                         initial_stop_price = price_at_signal * (1 - trailing_pct / 100)
 
                     try:
-                        res = kis_order.place_order(symbol=symbol, quantity=quantity_to_buy, price=0, order_type="BUY")
+                        tick_offset = getattr(settings, "BUY_PRICE_TICK_OFFSET", 2) or 0
+                        buy_price = _calc_buy_limit_price(price_at_signal, tick_offset)
+                        res = kis_order.place_order(symbol=symbol, quantity=quantity_to_buy, price=buy_price, order_type="BUY")
                         _log_trade(symbol, "BUY", price_at_signal, quantity_to_buy, OrderStatus.EXECUTED, res)
                         st_entry = {
                             "bought": True,
                             "purchase_price": price_at_signal,
                             "quantity": quantity_to_buy,
                             "initial_quantity": quantity_to_buy,
+                            "high_price": price_at_signal,
                             "stop_price": initial_stop_price,
                             "stage1_sell_done": False,
                             "stage2_sell_done": False,
@@ -534,9 +691,11 @@ def _run_trading_strategy_impl():
                         send_slack_notification(f"[매수 성공] {symbol}({quantity_to_buy}주) | 매수가: {price_at_signal:.0f}")
                         save_trade_status()
                         queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "BUY", "price": price_at_signal, "quantity": quantity_to_buy})
+                        _buy_cooldown.pop(symbol, None)  # 매수 성공 시 쿨다운 제거
                     except Exception as e:
                         _log_trade(symbol, "BUY", price_at_signal, quantity_to_buy, OrderStatus.FAILED, None)
-                        logger.error(f"[{symbol}] 매수 주문 실패: {e}")
+                        _buy_cooldown[symbol] = time.time() + _BUY_COOLDOWN_SECONDS
+                        logger.error(f"[{symbol}] 매수 주문 실패 (쿨다운 {_BUY_COOLDOWN_SECONDS}초 설정): {e}")
 
             time.sleep(0.2)
 
@@ -576,6 +735,83 @@ def sell_symbol(symbol: str, quantity: int | None = None) -> dict:
         _log_trade(symbol, "SELL", 0.0, sell_qty, OrderStatus.FAILED, None)
         logger.error(f"[{symbol}] 개별 매도 실패: {e}")
         return {"success": False, "message": str(e), "sold_quantity": 0}
+
+
+def buy_symbol(symbol: str, quantity: int | None = None, amount: int | None = None) -> dict:
+    """
+    수동 매수: 시장가로 매수 후 trade_status에 등록하여 자동 매도 관리를 받는다.
+    :param symbol: 종목코드 (예: "005930")
+    :param quantity: 매수 수량 (직접 지정)
+    :param amount: 매수 금액 (원 단위, quantity 미지정 시 사용)
+    :return: {"success": bool, "message": str, ...}
+    """
+    # 이미 보유 중이면 에러
+    st = trade_status.get(symbol)
+    if st and st.get("bought"):
+        return {"success": False, "message": f"{symbol} 이미 보유 중인 종목입니다."}
+
+    # 현재가 조회
+    try:
+        current_price = kis_market.get_current_price(symbol)
+    except Exception as e:
+        return {"success": False, "message": f"현재가 조회 실패: {e}"}
+
+    if not current_price or current_price <= 0:
+        return {"success": False, "message": f"{symbol} 현재가를 조회할 수 없습니다."}
+
+    # 수량 결정
+    if quantity and quantity > 0:
+        qty = quantity
+    elif amount and amount > 0:
+        qty = amount // int(current_price)
+        if qty < 1:
+            return {"success": False, "message": f"금액({amount:,}원)으로 1주도 매수할 수 없습니다. (현재가: {current_price:,.0f}원)"}
+    else:
+        return {"success": False, "message": "quantity 또는 amount 중 하나를 지정해야 합니다."}
+
+    # ATR 기반 손절가 계산
+    use_atr_stop = getattr(settings, "USE_ATR_STOP", False)
+    atr_mult = getattr(settings, "ATR_MULTIPLIER", 1.5)
+    trailing_pct = DEFAULT_STRATEGY_PARAMS.get("trailing_stop_pct", 4.0)
+    atr_val = indicators_service.get_atr(symbol) if use_atr_stop else None
+    if use_atr_stop and atr_val is not None and atr_val > 0:
+        initial_stop_price = current_price - atr_val * atr_mult
+    else:
+        initial_stop_price = current_price * (1 - trailing_pct / 100)
+
+    # 시장가 매수 주문
+    try:
+        res = kis_order.place_order(symbol=symbol, quantity=qty, price=0, order_type="BUY")
+        _log_trade(symbol, "BUY", current_price, qty, OrderStatus.EXECUTED, res)
+        st_entry = {
+            "bought": True,
+            "purchase_price": current_price,
+            "quantity": qty,
+            "initial_quantity": qty,
+            "high_price": current_price,
+            "stop_price": initial_stop_price,
+            "stage1_sell_done": False,
+            "stage2_sell_done": False,
+        }
+        if use_atr_stop and atr_val is not None:
+            st_entry["atr"] = atr_val
+        trade_status[symbol] = st_entry
+        save_trade_status()
+        logger.info(f"[{symbol}] 수동 매수 성공! {qty}주 @ {current_price:.0f}, 손절가: {initial_stop_price:.0f}")
+        send_slack_notification(f"[수동 매수] {symbol}({qty}주) | 매수가: {current_price:.0f}")
+        queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "BUY", "price": current_price, "quantity": qty})
+        return {
+            "success": True,
+            "message": f"{symbol} {qty}주 매수 체결 (시장가)",
+            "symbol": symbol,
+            "quantity": qty,
+            "price": current_price,
+            "stop_price": initial_stop_price,
+        }
+    except Exception as e:
+        _log_trade(symbol, "BUY", current_price, qty, OrderStatus.FAILED, None)
+        logger.error(f"[{symbol}] 수동 매수 실패: {e}")
+        return {"success": False, "message": f"매수 주문 실패: {e}"}
 
 
 def sell_all_at_close():
@@ -887,10 +1123,23 @@ class SellRequest(BaseModel):
     quantity: int | None = None  # 없거나 0이면 전량 매도
 
 
+class BuyRequest(BaseModel):
+    symbol: str                    # 종목코드 (예: "005930")
+    quantity: int | None = None    # 수량 직접 입력 (None이면 amount 사용)
+    amount: int | None = None      # 금액 입력 (원 단위, quantity 미지정 시 사용)
+
+
 @app.post("/api/sell")
 def api_sell(body: SellRequest):
     """개별 종목 매도 (전량 또는 지정 수량)"""
     result = sell_symbol(body.symbol, body.quantity)
+    return result
+
+
+@app.post("/api/buy")
+def api_buy(body: BuyRequest):
+    """수동 매수 (시장가). 매수 후 자동 매도 관리(익절/손절/트레일링스탑) 적용."""
+    result = buy_symbol(body.symbol, body.quantity, body.amount)
     return result
 
 

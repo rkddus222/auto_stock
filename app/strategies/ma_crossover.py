@@ -33,7 +33,7 @@ class MACrossover(Strategy):
             {"name": "trailing_stop_pct", "type": "float", "default": 5.0, "description": "트레일링 스톱 비율 (%)"},
         ]
 
-    def check_signal(self, symbol: str) -> tuple[str, float | None]:
+    def check_signal(self, symbol: str, current_price: float | None = None) -> tuple[str, float | None]:
         try:
             days = self.long_period + 3
             daily_data = kis_market.get_daily_ohlcv(symbol, days=days)
@@ -48,7 +48,8 @@ class MACrossover(Strategy):
             prev_short = np.mean(closes[1 : self.short_period + 1])
             prev_long = np.mean(closes[1 : self.long_period + 1])
 
-            current_price = kis_market.get_current_price(symbol)
+            if current_price is None:
+                current_price = kis_market.get_current_price(symbol)
             indicators = {
                 "short_ma": round(short_ma, 2),
                 "long_ma": round(long_ma, 2),

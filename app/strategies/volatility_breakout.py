@@ -5,15 +5,31 @@ from app.core.logger import logger
 import numpy as np
 
 
+def _compute_rsi(prices: list[float], period: int) -> float:
+    """RSI 계산 (순환 import 방지를 위해 로컬 정의)"""
+    if len(prices) < period + 1:
+        return 50.0
+    deltas = np.diff(prices)
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    avg_gain = np.mean(gains[-period:])
+    avg_loss = np.mean(losses[-period:])
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
 class VolatilityBreakout(Strategy):
     """변동성 돌파 전략 구현체 (트레일링 스톱 추가)"""
 
-    def __init__(self, ma_period=20, trailing_stop_pct=3.0, k=None, use_adaptive_k=None):
+    def __init__(self, ma_period=20, trailing_stop_pct=3.0, k=None, use_adaptive_k=None, rsi_exit_threshold=None):
         self.k = k if k is not None else settings.VOLATILITY_BREAKOUT_K
         self.ma_period = ma_period
         self.trailing_stop_pct = trailing_stop_pct
         self.use_adaptive_k = use_adaptive_k if use_adaptive_k is not None else getattr(settings, "USE_ADAPTIVE_K", True)
-        logger.debug(f"전략 초기화: 변동성 돌파(K={self.k}, 적응형={self.use_adaptive_k}) + {self.ma_period}일 MA 필터 | 트레일링 스톱: {self.trailing_stop_pct}%")
+        self.rsi_exit_threshold = rsi_exit_threshold if rsi_exit_threshold is not None else getattr(settings, "RSI_EXIT_THRESHOLD", 70.0)
+        logger.debug(f"전략 초기화: 변동성 돌파(K={self.k}, 적응형={self.use_adaptive_k}) + {self.ma_period}일 MA 필터 | 트레일링 스톱: {self.trailing_stop_pct}% | RSI 매도: {self.rsi_exit_threshold}")
 
     def get_strategy_name(self) -> str:
         return "volatility_breakout"
@@ -24,6 +40,7 @@ class VolatilityBreakout(Strategy):
             "ma_period": self.ma_period,
             "trailing_stop_pct": self.trailing_stop_pct,
             "use_adaptive_k": self.use_adaptive_k,
+            "rsi_exit_threshold": self.rsi_exit_threshold,
         }
 
     @classmethod
@@ -33,10 +50,11 @@ class VolatilityBreakout(Strategy):
             {"name": "ma_period", "type": "int", "default": 20, "description": "이동평균 기간 (일)"},
             {"name": "trailing_stop_pct", "type": "float", "default": 3.0, "description": "트레일링 스톱 비율 (%)"},
             {"name": "use_adaptive_k", "type": "bool", "default": True, "description": "전일 변동성 기반 적응형 K 사용"},
+            {"name": "rsi_exit_threshold", "type": "float", "default": 70.0, "description": "RSI 과매수 매도 기준 (0=비활성)"},
         ]
 
-    def check_signal(self, symbol: str) -> tuple[str, float | None]:
-        """매수 신호 확인 로직"""
+    def check_signal(self, symbol: str, current_price: float | None = None) -> tuple[str, float | None]:
+        """매수/매도 신호 확인 로직 (RSI 과매수 시 SELL 반환)"""
         try:
             daily_data = kis_market.get_daily_ohlcv(symbol, days=self.ma_period + 2)
             if not daily_data or len(daily_data) < self.ma_period + 1:
@@ -45,9 +63,19 @@ class VolatilityBreakout(Strategy):
 
             closing_prices = [float(day['stck_clpr']) for day in daily_data[1:self.ma_period + 1]]
             ma20 = np.mean(closing_prices)
-            current_price = kis_market.get_current_price(symbol)
+            if current_price is None:
+                current_price = kis_market.get_current_price(symbol)
 
             indicators = {"ma": round(ma20, 2), "current_price": current_price, "k": self.k}
+
+            # RSI 계산 (이후 매도 판단에 사용, BUY 신호보다 후순위)
+            rsi_sell = False
+            if self.rsi_exit_threshold > 0:
+                closes_asc = list(reversed(closing_prices))
+                rsi_val = _compute_rsi(closes_asc, min(14, len(closes_asc) - 1))
+                indicators["rsi"] = round(rsi_val, 2)
+                if rsi_val >= self.rsi_exit_threshold:
+                    rsi_sell = True
 
             if current_price < ma20:
                 logger.debug(f"[{symbol}] 하락 추세, 매수 보류 (현재가: {current_price} < MA: {ma20})")
@@ -114,6 +142,13 @@ class VolatilityBreakout(Strategy):
                 self.log_decision(symbol, "BUY", f"변동성 돌파 (현재가 >= 목표가 {target_price:.0f})",
                                   indicators, current_price, "EXECUTED")
                 return "BUY", current_price
+
+            # BUY 아닌 경우: RSI 과매수 시 SELL 반환 (보유 종목 이익실현용)
+            if rsi_sell:
+                logger.debug(f"[{symbol}] RSI 과매수 매도 신호 (RSI={indicators.get('rsi')} >= {self.rsi_exit_threshold})")
+                self.log_decision(symbol, "SELL", f"RSI 과매수 (RSI={indicators.get('rsi')} >= {self.rsi_exit_threshold})",
+                                  indicators, current_price, "EXECUTED")
+                return "SELL", None
 
             self.log_decision(symbol, "HOLD", f"목표가 미도달 (현재가 < {target_price:.0f})",
                               indicators, current_price, "SKIPPED")

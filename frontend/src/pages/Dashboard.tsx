@@ -6,6 +6,7 @@ import TradeHistory from '../components/TradeHistory';
 import PriceChart from '../components/PriceChart';
 import PositionsTable from '../components/PositionsTable';
 import StrategySettings from '../components/StrategySettings';
+import ManualBuy from '../components/ManualBuy';
 import { useToast } from '../components/Toast';
 import { useWebSocket } from '../hooks/useWebSocket';
 
@@ -133,6 +134,7 @@ const Dashboard = () => {
                 showToast(data.success ? 'success' : 'info', data.message ?? '동기화 완료');
               }}
             />
+            <ManualBuy />
             <StrategySettings />
             <TradeHistory />
           </div>

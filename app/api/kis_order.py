@@ -71,6 +71,11 @@ def place_order(symbol: str, quantity: int, price: int, order_type: str):
             return res
         else:
             msg1 = res.get("msg1", "주문 실패")
+            if "파생ETF" in msg1:
+                logger.info(
+                    "파생ETF는 계좌에서 '선택확인서' 신청 후 거래 가능합니다. "
+                    "해당 종목을 .env의 BLACKLIST_SYMBOLS에 추가하면 자동매매 대상에서 제외됩니다."
+                )
             try:
                 path_balance = "/uapi/domestic-stock/v1/trading/inquire-balance"
                 url_balance = f"{kis_auth.base_url}{path_balance}"

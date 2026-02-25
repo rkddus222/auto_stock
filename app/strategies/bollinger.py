@@ -33,7 +33,7 @@ class BollingerStrategy(Strategy):
             {"name": "trailing_stop_pct", "type": "float", "default": 5.0, "description": "트레일링 스톱 비율 (%)"},
         ]
 
-    def check_signal(self, symbol: str) -> tuple[str, float | None]:
+    def check_signal(self, symbol: str, current_price: float | None = None) -> tuple[str, float | None]:
         try:
             days = self.period + 5
             daily_data = kis_market.get_daily_ohlcv(symbol, days=days)
@@ -48,7 +48,8 @@ class BollingerStrategy(Strategy):
                 std = 1e-10
             upper = ma + self.std_dev * std
             lower = ma - self.std_dev * std
-            current_price = kis_market.get_current_price(symbol)
+            if current_price is None:
+                current_price = kis_market.get_current_price(symbol)
             indicators = {
                 "upper": round(upper, 2),
                 "lower": round(lower, 2),

@@ -10,10 +10,11 @@ class Strategy(ABC):
     """모든 매매 전략의 기본이 되는 추상 클래스"""
 
     @abstractmethod
-    def check_signal(self, symbol: str) -> tuple[str, float | None]:
+    def check_signal(self, symbol: str, current_price: float | None = None) -> tuple[str, float | None]:
         """
         매수/매도/홀드 신호를 결정합니다.
         :param symbol: 주식 종목 코드
+        :param current_price: 현재가 (외부에서 전달 시 API 중복 호출 방지, None이면 내부에서 조회)
         :return: ("BUY", 목표가) or ("SELL", None) or ("HOLD", None)
         """
         pass

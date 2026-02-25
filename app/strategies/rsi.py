@@ -50,7 +50,7 @@ class RSIStrategy(Strategy):
             {"name": "trailing_stop_pct", "type": "float", "default": 5.0, "description": "트레일링 스톱 비율 (%)"},
         ]
 
-    def check_signal(self, symbol: str) -> tuple[str, float | None]:
+    def check_signal(self, symbol: str, current_price: float | None = None) -> tuple[str, float | None]:
         try:
             days = self.period + 20
             daily_data = kis_market.get_daily_ohlcv(symbol, days=days)
@@ -61,7 +61,8 @@ class RSIStrategy(Strategy):
             closes = [float(d["stck_clpr"]) for d in daily_data[1:days]]
             closes_asc = list(reversed(closes))
             rsi_val = _compute_rsi(closes_asc, self.period)
-            current_price = kis_market.get_current_price(symbol)
+            if current_price is None:
+                current_price = kis_market.get_current_price(symbol)
             indicators = {"rsi": round(rsi_val, 2), "current_price": current_price}
 
             if rsi_val < self.oversold:

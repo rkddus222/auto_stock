@@ -31,6 +31,30 @@ cp .env.example .env
 
 **필수 항목**만 채워도 동작합니다. 나머지는 선택이며, 넣지 않으면 기본값이 적용됩니다.
 
+#### .env.example 내용 설명
+
+| 구분 | 변수/설정 | 설명 |
+|------|-----------|------|
+| **거래 모드** | `MOCK_TRADE` | `True`=모의투자, `False`=실전. 실전 전 반드시 확인 |
+| **종목 소스** | `TARGET_SYMBOLS` | 고정 종목 사용 시 쉼표 구분 종목코드 |
+| | `USE_VOLUME_RANK` | `True`면 거래량 상위 API로 종목 발굴 (HTS 불필요) |
+| | `USE_CONDITION_SEARCH` | `True`면 HTS 조건검색 결과로 종목 갱신 |
+| **필터** | `CONDITION_SEARCH_MAX` | 거래량/조건검색 시 가져올 최대 종목 수 (후보 수) |
+| | `CONDITION_MIN_PRICE` / `CONDITION_MAX_PRICE` | 가격 범위(원). 동전주·고가주 제외용 |
+| **자금** | `BUDGET_RATIO` | 예수금의 몇 %를 매매에 쓸지 (0~1) |
+| **슬롯** | `MAX_SLOTS` | 동시 보유 최대 종목 수. `SCAN_INTERVAL`은 빈 자리 채울 때 재검색 간격(초) |
+| **진입 시간** | `ENTRY_NO_BEFORE_MINUTE` 등 | 매수 허용 구간. 0, 15, 20 이면 09:00~15:20 허용 |
+| **진입 필터** | `ENTRY_GAP_UP_PCT` | 갭업 이 % 이상이면 매수 스킵 (0=미적용) |
+| | `ENTRY_VOLUME_RATIO` | 거래량 배수 필터 (0=미적용) |
+| | `ENTRY_MAX_UP_FROM_OPEN_PCT` | 시가 대비 이 % 이상 오른 종목 매수 스킵 (상한가 30% 고려, 기본 10% 권장) |
+| **일별 리스크** | `DAILY_LOSS_LIMIT_PCT` | 당일 손실 이 % 이하면 신규 매수 중단 |
+| | `MAX_DAILY_TRADES` | 당일 체결 건수 제한 (0=제한 없음) |
+| **ATR 손절** | `USE_ATR_STOP` | `True`면 ATR 기반 손절가 사용. `ATR_PERIOD`, `ATR_MULTIPLIER`로 조정 |
+| **스코어링** | `USE_STOCK_SCORING` | `True`면 후보 스코어 상위만 진입 (품질 필터) |
+| **제외 종목** | `BLACKLIST_SYMBOLS` | 쉼표 구분 종목코드. 파생ETF 미신청 종목 등 제외 시 사용 |
+
+각 변수에 대한 상세 주석은 **.env.example** 파일에 적어 두었습니다. 복사 후 필요한 항목만 수정해 사용하면 됩니다.
+
 ### 2. 패키지 설치
 
 ```bash
@@ -100,6 +124,7 @@ uvicorn app.main:app --reload
 | `ENTRY_NO_AFTER_MINUTE` | `30` | 14:30이면 HOUR=14, MINUTE=30 |
 | `ENTRY_GAP_UP_PCT` | `5.0` | 전일 대비 갭업 이 % 이상이면 진입 스킵 (0=미적용) |
 | `ENTRY_VOLUME_RATIO` | `1.5` | 돌파 시점 거래량 ≥ 직전 20봉 평균×이 값일 때만 진입 (0=미적용) |
+| `ENTRY_MAX_UP_FROM_OPEN_PCT` | `10.0` | 당일 시가 대비 이 % 이상 상승한 종목은 진입 스킵 (국장 상한가 30% 고려) |
 
 ### 일별 리스크 관리
 
