@@ -36,6 +36,7 @@ from app.services import portfolio as portfolio_service
 from app.services import reconciliation as reconciliation_service
 from app.services import indicators as indicators_service
 from app.services import stock_scoring as stock_scoring_service
+from app.services import llm_advisor as llm_advisor_service
 from app.strategies.registry import StrategyRegistry
 from app.services.websocket_manager import ws_manager
 
@@ -55,6 +56,8 @@ _trading_job_lock = threading.Lock()
 # 매수 실패 시 종목별 쿨다운 (symbol -> 쿨다운 만료 시각 epoch)
 _buy_cooldown: dict[str, float] = {}
 _BUY_COOLDOWN_SECONDS = 300  # 5분
+# LLM 매수 거부 시 종목별 쿨다운 (symbol -> 쿨다운 만료 시각 epoch)
+_llm_reject_cooldown: dict[str, float] = {}
 
 DEFAULT_STRATEGY_NAME = "volatility_breakout"
 DEFAULT_STRATEGY_PARAMS = {"ma_period": 20, "trailing_stop_pct": 4.0, "k": getattr(settings, "VOLATILITY_BREAKOUT_K", 0.5)}
@@ -641,25 +644,62 @@ def _run_trading_strategy_impl():
                     del _buy_cooldown[s]
                 signal, price_at_signal = strategy.check_signal(symbol, current_price=current_price)
                 if signal == "BUY" and price_at_signal is not None:
-                    # 상친거(시가 대비 N% 이상 상승) 매수 방지 — 국장 상한가 30%이므로 기본 10% 초과 상승 시 진입 스킵
-                    max_up_pct = getattr(settings, "ENTRY_MAX_UP_FROM_OPEN_PCT", 10.0) or 0
-                    if max_up_pct > 0:
-                        try:
-                            daily = kis_market.get_daily_ohlcv(symbol, days=1)
-                            if daily and len(daily) > 0:
-                                today_open = float(daily[0].get("stck_oprc") or 0)
-                                if today_open > 0 and price_at_signal >= today_open * (1 + max_up_pct / 100):
-                                    logger.debug(f"[{symbol}] 매수 스킵: 시가 대비 {max_up_pct}% 이상 상승 (시가={today_open:.0f}, 현재가={price_at_signal:.0f})")
-                                    time.sleep(0.2)
-                                    continue
-                        except Exception as e:
-                            logger.debug(f"[{symbol}] 시가 조회 실패, 상승률 필터 스킵: {e}")
+                    # 상친거(시가 대비 N% 이상 상승) 매수 방지 — LLM 활성 시 바이패스 (LLM이 판단)
+                    if not settings.USE_LLM_ADVISOR:
+                        max_up_pct = getattr(settings, "ENTRY_MAX_UP_FROM_OPEN_PCT", 10.0) or 0
+                        if max_up_pct > 0:
+                            try:
+                                daily = kis_market.get_daily_ohlcv(symbol, days=1)
+                                if daily and len(daily) > 0:
+                                    today_open = float(daily[0].get("stck_oprc") or 0)
+                                    if today_open > 0 and price_at_signal >= today_open * (1 + max_up_pct / 100):
+                                        logger.debug(f"[{symbol}] 매수 스킵: 시가 대비 {max_up_pct}% 이상 상승 (시가={today_open:.0f}, 현재가={price_at_signal:.0f})")
+                                        time.sleep(0.2)
+                                        continue
+                            except Exception as e:
+                                logger.debug(f"[{symbol}] 시가 조회 실패, 상승률 필터 스킵: {e}")
 
                     quantity_to_buy = int(budget_per_stock // price_at_signal)
                     if quantity_to_buy < 1:
                         logger.debug(f"[{symbol}] 매수 스킵: 예산 부족 (종목당 예산으로 1주 미만)")
                         time.sleep(0.2)
                         continue
+
+                    # --- LLM 매수 어드바이저 검증 ---
+                    if settings.USE_LLM_ADVISOR:
+                        # LLM 거부 쿨다운 체크: 이전에 거부당한 종목은 일정 시간 재시도하지 않음
+                        llm_cd_until = _llm_reject_cooldown.get(symbol, 0)
+                        if now_ts < llm_cd_until:
+                            remaining = int(llm_cd_until - now_ts)
+                            logger.debug(f"[{symbol}] LLM 거부 쿨다운 중 (남은 {remaining}초)")
+                            time.sleep(0.2)
+                            continue
+                        # 만료된 LLM 거부 쿨다운 정리
+                        expired_llm = [s for s, t in _llm_reject_cooldown.items() if now_ts >= t]
+                        for s in expired_llm:
+                            del _llm_reject_cooldown[s]
+
+                        try:
+                            ohlcv_for_llm = kis_market.get_daily_ohlcv(symbol, days=5) or []
+                            llm_indicators = getattr(strategy, "last_indicators", {})
+                            llm_reason = getattr(strategy, "last_decision_reason", "")
+                            llm_approved, llm_msg = llm_advisor_service.should_buy(
+                                symbol=symbol,
+                                current_price=price_at_signal,
+                                indicators=llm_indicators,
+                                ohlcv_recent=ohlcv_for_llm,
+                                strategy_reason=llm_reason,
+                            )
+                            if not llm_approved:
+                                cooldown_sec = getattr(settings, "LLM_REJECT_COOLDOWN", 1800)
+                                _llm_reject_cooldown[symbol] = time.time() + cooldown_sec
+                                logger.info(f"[{symbol}] LLM 매수 거부: {llm_msg} (쿨다운 {cooldown_sec}초)")
+                                send_slack_notification(f"[LLM 매수 거부] {symbol} | {llm_msg} (재시도 {cooldown_sec//60}분 후)")
+                                time.sleep(0.2)
+                                continue
+                            logger.info(f"[{symbol}] LLM 매수 승인: {llm_msg}")
+                        except Exception as e:
+                            logger.warning(f"[{symbol}] LLM 어드바이저 오류, 매수 진행 (fail-open): {e}")
 
                     use_atr_stop = getattr(settings, "USE_ATR_STOP", False)
                     atr_mult = getattr(settings, "ATR_MULTIPLIER", 1.5)

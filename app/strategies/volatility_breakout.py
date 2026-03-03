@@ -77,13 +77,20 @@ class VolatilityBreakout(Strategy):
                 if rsi_val >= self.rsi_exit_threshold:
                     rsi_sell = True
 
-            if current_price < ma20:
-                logger.debug(f"[{symbol}] 하락 추세, 매수 보류 (현재가: {current_price} < MA: {ma20})")
-                self.log_decision(symbol, "HOLD", f"하락 추세 (현재가 < MA{self.ma_period})",
-                                  indicators, current_price, "SKIPPED")
-                return "HOLD", None
+            llm_active = getattr(settings, "USE_LLM_ADVISOR", False)
 
-            logger.debug(f"[{symbol}] 상승 추세 확인 (현재가: {current_price} > MA: {ma20})")
+            if current_price < ma20:
+                if not llm_active:
+                    logger.debug(f"[{symbol}] 하락 추세, 매수 보류 (현재가: {current_price} < MA: {ma20})")
+                    self.log_decision(symbol, "HOLD", f"하락 추세 (현재가 < MA{self.ma_period})",
+                                      indicators, current_price, "SKIPPED")
+                    return "HOLD", None
+                logger.debug(f"[{symbol}] 하락 추세이나 LLM 판단 위임 (현재가: {current_price} < MA: {ma20})")
+                indicators["ma_filter"] = "BELOW"
+            else:
+                indicators["ma_filter"] = "ABOVE"
+
+            logger.debug(f"[{symbol}] 추세 확인 (현재가: {current_price}, MA: {ma20})")
 
             prev_day = daily_data[1]
             prev_high = float(prev_day["stck_hgpr"])
@@ -94,9 +101,12 @@ class VolatilityBreakout(Strategy):
             # 갭 필터: 당일 시가가 전일 종가 대비 +ENTRY_GAP_UP_PCT% 이상 갭업이면 진입 스킵
             gap_up_pct = getattr(settings, "ENTRY_GAP_UP_PCT", 5.0) or 0
             if gap_up_pct > 0 and prev_close > 0 and today_open >= prev_close * (1 + gap_up_pct / 100):
-                logger.debug(f"[{symbol}] 갭업 필터 스킵 (시가 {today_open:.0f} >= 전일종가*{1+gap_up_pct/100:.2f})")
-                self.log_decision(symbol, "HOLD", f"갭업 {gap_up_pct}% 이상 진입 스킵", indicators, current_price, "SKIPPED")
-                return "HOLD", None
+                if not llm_active:
+                    logger.debug(f"[{symbol}] 갭업 필터 스킵 (시가 {today_open:.0f} >= 전일종가*{1+gap_up_pct/100:.2f})")
+                    self.log_decision(symbol, "HOLD", f"갭업 {gap_up_pct}% 이상 진입 스킵", indicators, current_price, "SKIPPED")
+                    return "HOLD", None
+                logger.debug(f"[{symbol}] 갭업 감지, LLM 판단 위임 (갭업 {gap_up_pct}% 이상)")
+                indicators["gap_filter"] = "TRIGGERED"
 
             volatility = prev_high - prev_low
             # 적응형 K: 전일 변동폭/전일 종가 비율에 따라 K 조절
@@ -129,17 +139,24 @@ class VolatilityBreakout(Strategy):
                         vols = [float(d[vol_key]) for d in daily_data[1 : self.ma_period + 1] if d.get(vol_key) is not None]
                         if len(vols) >= self.ma_period:
                             avg_vol_20 = sum(vols) / len(vols)
+                            if avg_vol_20 > 0:
+                                indicators["volume_ratio"] = round(today_vol / avg_vol_20, 2)
                             if avg_vol_20 > 0 and today_vol < avg_vol_20 * volume_ratio_req:
-                                logger.debug(f"[{symbol}] 거래량 필터 스킵 (당일 {today_vol:.0f} < 20일평균*{volume_ratio_req})")
-                                self.log_decision(symbol, "HOLD", f"거래량 부족 (당일 < 20일평균*{volume_ratio_req})",
-                                                  indicators, current_price, "SKIPPED")
-                                return "HOLD", None
+                                if not llm_active:
+                                    logger.debug(f"[{symbol}] 거래량 필터 스킵 (당일 {today_vol:.0f} < 20일평균*{volume_ratio_req})")
+                                    self.log_decision(symbol, "HOLD", f"거래량 부족 (당일 < 20일평균*{volume_ratio_req})",
+                                                      indicators, current_price, "SKIPPED")
+                                    return "HOLD", None
+                                logger.debug(f"[{symbol}] 거래량 부족이나 LLM 판단 위임")
+                                indicators["volume_filter"] = "TRIGGERED"
                     except (TypeError, ValueError, KeyError):
                         pass
 
             if current_price >= target_price:
                 logger.debug(f"[{symbol}] 매수 신호 발생! 목표가 {target_price:.2f} 돌파")
-                self.log_decision(symbol, "BUY", f"변동성 돌파 (현재가 >= 목표가 {target_price:.0f})",
+                self.last_indicators = dict(indicators)
+                self.last_decision_reason = f"변동성 돌파 (현재가 >= 목표가 {target_price:.0f})"
+                self.log_decision(symbol, "BUY", self.last_decision_reason,
                                   indicators, current_price, "EXECUTED")
                 return "BUY", current_price
 

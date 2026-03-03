@@ -9,6 +9,9 @@ from app.core.logger import logger
 class Strategy(ABC):
     """모든 매매 전략의 기본이 되는 추상 클래스"""
 
+    last_indicators: dict = {}
+    last_decision_reason: str = ""
+
     @abstractmethod
     def check_signal(self, symbol: str, current_price: float | None = None) -> tuple[str, float | None]:
         """

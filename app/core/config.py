@@ -74,6 +74,16 @@ class Settings(BaseSettings):
     # 종목 스코어링 (동적 종목 사용 시 상위 N개만 진입)
     USE_STOCK_SCORING: bool = False      # True 시 후보를 스코어로 정렬 후 상위 MAX_SLOTS만
 
+    # LLM 매수 어드바이저 (Gemini via Vertex AI)
+    USE_LLM_ADVISOR: bool = False        # True 시 BUY 신호 발생 후 LLM 검증 추가
+    GEMINI_API_KEY: str = ""             # (레거시) 직접 API 키 방식. 비워두면 Vertex AI 사용
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+    VERTEX_SERVICE_ACCOUNT: str = "gemini_service_account.json"  # 서비스 계정 JSON 경로
+    VERTEX_PROJECT_ID: str = ""          # 비워두면 서비스 계정 JSON에서 자동 추출
+    VERTEX_REGION: str = "asia-northeast3" # Vertex AI 리전 (서울)
+    LLM_MAX_DAILY_CALLS: int = 50        # 일일 최대 LLM 호출 횟수
+    LLM_REJECT_COOLDOWN: int = 1800       # LLM 매수 거부 시 해당 종목 재시도 대기(초), 기본 30분
+
     # 데이터/상태 파일 기준 디렉터리 (비우면 프로젝트 루트)
     DATA_DIR: str = ""
 
