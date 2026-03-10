@@ -62,6 +62,8 @@ class Settings(BaseSettings):
 
     # RSI 이익실현: 보유 중 RSI가 이 값 이상이면 SELL 신호 (0=비활성)
     RSI_EXIT_THRESHOLD: float = 70.0
+    # RSI 매수 진입 차단: RSI가 이 값 이상이면 BUY 신호 자체를 발생시키지 않음 (0=비활성)
+    RSI_ENTRY_BLOCK: float = 65.0
 
     # 시장 지수 필터: 지수가 N일 이평 아래면 신규 매수 금지 (0=비활성)
     MARKET_INDEX_CODE: str = "1001"      # 1001=코스닥, 0001=코스피
@@ -83,6 +85,7 @@ class Settings(BaseSettings):
     VERTEX_REGION: str = "asia-northeast3" # Vertex AI 리전 (서울)
     LLM_MAX_DAILY_CALLS: int = 50        # 일일 최대 LLM 호출 횟수
     LLM_REJECT_COOLDOWN: int = 1800       # LLM 매수 거부 시 해당 종목 재시도 대기(초), 기본 30분
+    LLM_ENTRY_K_MULTIPLIER: float = 0.9   # LLM 사용 시 돌파 목표가 완화 (1.0=기본, 0.9=목표가 10% 낮춤 → 신호 증가, LLM이 최종 필터)
 
     # 데이터/상태 파일 기준 디렉터리 (비우면 프로젝트 루트)
     DATA_DIR: str = ""

@@ -1,8 +1,8 @@
 """
 Gemini LLM 매수 어드바이저 — 전략 BUY 신호를 LLM이 한 번 더 검증한다.
 Vertex AI (서비스 계정) 우선, GEMINI_API_KEY 설정 시 직접 API 폴백.
-Fail-open 설계: API 실패/타임아웃 시 매수를 허용한다 (기회 손실 방지).
-429 Rate Limit 시에만 fail-close (매수 보류).
+Fail-close 설계: API 실패/파싱 에러 시 매수를 보류한다 (손실 방지 우선).
+타임아웃만 fail-open (일시적 네트워크 지연은 기회 손실 방지).
 """
 
 import json
@@ -28,6 +28,60 @@ _vertex_token_expiry: float = 0.0
 
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 VERTEX_API_URL = "https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:generateContent"
+_MAX_RETRIES: int = 2  # JSON 파싱 실패 시 재시도 횟수
+
+
+def _extract_json_from_parts(parts: list[dict]) -> dict | None:
+    """Gemini 응답 parts에서 decision JSON을 안정적으로 추출한다."""
+    import re
+
+    for part in reversed(parts):
+        if part.get("thought"):
+            continue
+        raw_text = part.get("text", "").strip()
+        if not raw_text:
+            continue
+
+        # 1차: 그대로 파싱
+        try:
+            result = json.loads(raw_text)
+            if "decision" in result:
+                return result
+        except json.JSONDecodeError:
+            pass
+
+        # 2차: ```json ... ``` 코드 블록 추출
+        m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw_text, re.DOTALL)
+        if m:
+            try:
+                result = json.loads(m.group(1))
+                if "decision" in result:
+                    return result
+            except json.JSONDecodeError:
+                pass
+
+        # 3차: 가장 바깥쪽 { } 블록 추출
+        m = re.search(r'\{[^{}]*"decision"\s*:\s*"[^"]*"[^{}]*\}', raw_text)
+        if m:
+            try:
+                result = json.loads(m.group())
+                if "decision" in result:
+                    return result
+            except json.JSONDecodeError:
+                pass
+
+        # 4차: 줄바꿈/제어문자 정리 후 재시도
+        cleaned = re.sub(r'[\x00-\x1f]+', ' ', raw_text)
+        cleaned = re.sub(r',\s*}', '}', cleaned)  # trailing comma 제거
+        cleaned = re.sub(r',\s*]', ']', cleaned)
+        try:
+            result = json.loads(cleaned)
+            if "decision" in result:
+                return result
+        except json.JSONDecodeError:
+            pass
+
+    return None
 
 
 def _get_vertex_access_token() -> str | None:
@@ -374,86 +428,84 @@ def should_buy(
     if elapsed < _MIN_CALL_INTERVAL:
         time.sleep(_MIN_CALL_INTERVAL - elapsed)
 
-    try:
-        _last_call_ts = time.time()
+    last_error_msg = ""
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            _last_call_ts = time.time()
 
-        # Vertex AI 우선, 실패 시 직접 API 폴백
-        resp = None
-        used_vertex = False
-        if has_vertex:
-            try:
-                resp = _call_vertex(prompt)
-                used_vertex = True
-                backend = "Vertex AI"
-            except Exception as ve:
-                logger.warning(f"[LLM] Vertex AI 호출 실패, 직접 API 폴백: {ve}")
-                resp = None
+            # Vertex AI 우선, 실패 시 직접 API 폴백
+            resp = None
+            used_vertex = False
+            if has_vertex:
+                try:
+                    resp = _call_vertex(prompt)
+                    used_vertex = True
+                    backend = "Vertex AI"
+                except Exception as ve:
+                    logger.warning(f"[LLM] Vertex AI 호출 실패, 직접 API 폴백: {ve}")
+                    resp = None
 
-        if resp is None and has_api_key:
-            resp = _call_direct_api(prompt)
-            backend = "Direct API"
+            if resp is None and has_api_key:
+                resp = _call_direct_api(prompt)
+                backend = "Direct API"
 
-        if resp is None:
-            raise RuntimeError("사용 가능한 LLM 백엔드 없음")
+            if resp is None:
+                raise RuntimeError("사용 가능한 LLM 백엔드 없음")
 
-        _daily_call_count += 1
+            _daily_call_count += 1
 
-        # 429 Rate Limit → 매수 보류 (fail-close)
-        if resp.status_code == 429:
-            logger.warning(f"[LLM] {symbol} API 요청 한도 초과 (429, {backend}), 매수 보류")
-            _log_decision(symbol, "RATE_LIMITED", 0, f"API 429 ({backend})", current_price, "REJECTED")
-            return False, f"LLM API 요청 한도 초과 ({backend}, 매수 보류)"
+            # 429 Rate Limit → 매수 보류 (fail-close)
+            if resp.status_code == 429:
+                logger.warning(f"[LLM] {symbol} API 요청 한도 초과 (429, {backend}), 매수 보류")
+                _log_decision(symbol, "RATE_LIMITED", 0, f"API 429 ({backend})", current_price, "REJECTED")
+                return False, f"LLM API 요청 한도 초과 ({backend}, 매수 보류)"
 
-        resp.raise_for_status()
+            resp.raise_for_status()
 
-        data = resp.json()
-        parts = data["candidates"][0]["content"]["parts"]
+            data = resp.json()
+            parts = data["candidates"][0]["content"]["parts"]
 
-        # gemini-2.5-flash thinking 모델: parts에 thought + 실제 답변이 분리됨
-        # thought가 아닌 마지막 part에서 JSON 추출
-        result = None
-        for part in reversed(parts):
-            if part.get("thought"):
+            result = _extract_json_from_parts(parts)
+
+            if result is None:
+                # 파싱 실패 시 재시도 가능하면 재시도
+                if attempt < _MAX_RETRIES:
+                    logger.warning(f"[LLM] {symbol} 응답 JSON 파싱 실패, 재시도 ({attempt + 1}/{_MAX_RETRIES})")
+                    time.sleep(_MIN_CALL_INTERVAL)
+                    continue
+                logger.warning(f"[LLM] {symbol} 응답 JSON 파싱 실패 ({_MAX_RETRIES + 1}회 시도), 매수 보류")
+                _log_decision(symbol, "PARSE_ERROR", 0, f"응답 JSON 파싱 실패 ({_MAX_RETRIES + 1}회)", current_price, "REJECTED")
+                return False, "LLM 응답 파싱 실패 (매수 보류)"
+
+            decision = result.get("decision", "BUY").upper()
+            confidence = int(result.get("confidence", 50))
+            reason = result.get("reason", "")
+
+            approved = decision == "BUY"
+            action = "APPROVED" if approved else "REJECTED"
+            _log_decision(symbol, decision, confidence, reason, current_price, action)
+
+            tag = "승인" if approved else "거부"
+            logger.info(
+                f"[LLM 매수 {tag}] {symbol} | {backend} | 판단={decision}, 확신도={confidence}, 사유={reason}"
+            )
+            return approved, f"LLM {tag}: {reason} (확신도 {confidence}%)"
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"[LLM] {symbol} API 타임아웃, 매수 허용 (fail-open)")
+            _log_decision(symbol, "TIMEOUT", 0, "API 타임아웃", current_price, "FAIL_OPEN")
+            return True, "LLM API 타임아웃 (fail-open)"
+        except Exception as e:
+            last_error_msg = str(e)
+            if "key=" in last_error_msg:
+                last_error_msg = last_error_msg.split("?")[0] + " (URL 파라미터 생략)"
+            if attempt < _MAX_RETRIES:
+                logger.warning(f"[LLM] {symbol} API 오류, 재시도 ({attempt + 1}/{_MAX_RETRIES}): {last_error_msg}")
+                time.sleep(_MIN_CALL_INTERVAL)
                 continue
-            raw_text = part.get("text", "")
-            try:
-                result = json.loads(raw_text)
-                break
-            except json.JSONDecodeError:
-                # JSON 블록이 텍스트에 섞여있을 수 있음
-                import re
-                m = re.search(r'\{[^{}]*"decision"\s*:\s*"[^"]+?"[^{}]*\}', raw_text)
-                if m:
-                    result = json.loads(m.group())
-                    break
+            logger.warning(f"[LLM] {symbol} API 오류 ({_MAX_RETRIES + 1}회 시도), 매수 보류 (fail-close): {last_error_msg}")
+            _log_decision(symbol, "ERROR", 0, last_error_msg[:200], current_price, "REJECTED")
+            return False, f"LLM API 오류 (fail-close): {last_error_msg}"
 
-        if result is None:
-            logger.warning(f"[LLM] {symbol} 응답 JSON 파싱 실패, 매수 보류")
-            _log_decision(symbol, "PARSE_ERROR", 0, "응답 JSON 파싱 실패", current_price, "REJECTED")
-            return False, "LLM 응답 파싱 실패 (매수 보류)"
-
-        decision = result.get("decision", "BUY").upper()
-        confidence = int(result.get("confidence", 50))
-        reason = result.get("reason", "")
-
-        approved = decision == "BUY"
-        action = "APPROVED" if approved else "REJECTED"
-        _log_decision(symbol, decision, confidence, reason, current_price, action)
-
-        tag = "승인" if approved else "거부"
-        logger.info(
-            f"[LLM 매수 {tag}] {symbol} | {backend} | 판단={decision}, 확신도={confidence}, 사유={reason}"
-        )
-        return approved, f"LLM {tag}: {reason} (확신도 {confidence}%)"
-
-    except requests.exceptions.Timeout:
-        logger.warning(f"[LLM] {symbol} API 타임아웃, 매수 허용 (fail-open)")
-        _log_decision(symbol, "TIMEOUT", 0, "API 타임아웃", current_price, "FAIL_OPEN")
-        return True, "LLM API 타임아웃 (fail-open)"
-    except Exception as e:
-        err_msg = str(e)
-        if "key=" in err_msg:
-            err_msg = err_msg.split("?")[0] + " (URL 파라미터 생략)"
-        logger.warning(f"[LLM] {symbol} API 오류, 매수 허용 (fail-open): {err_msg}")
-        _log_decision(symbol, "ERROR", 0, err_msg[:200], current_price, "FAIL_OPEN")
-        return True, f"LLM API 오류 (fail-open): {err_msg}"
+    # 이론상 도달 불가, 안전장치
+    return False, "LLM 판단 실패 (fail-close)"

@@ -68,14 +68,28 @@ class VolatilityBreakout(Strategy):
 
             indicators = {"ma": round(ma20, 2), "current_price": current_price, "k": self.k}
 
-            # RSI 계산 (이후 매도 판단에 사용, BUY 신호보다 후순위)
+            # RSI 계산 (매수 진입 차단 + 보유 중 매도 판단에 모두 사용)
             rsi_sell = False
+            rsi_val = 50.0
             if self.rsi_exit_threshold > 0:
                 closes_asc = list(reversed(closing_prices))
                 rsi_val = _compute_rsi(closes_asc, min(14, len(closes_asc) - 1))
                 indicators["rsi"] = round(rsi_val, 2)
                 if rsi_val >= self.rsi_exit_threshold:
                     rsi_sell = True
+
+            # RSI 과매수 시 BUY 신호 자체를 차단 (RSI >= rsi_entry_block 이면 진입 금지)
+            rsi_entry_block = getattr(settings, "RSI_ENTRY_BLOCK", 65.0)
+            if rsi_entry_block > 0 and rsi_val >= rsi_entry_block:
+                logger.debug(f"[{symbol}] RSI 과매수 매수 차단 (RSI={rsi_val:.1f} >= {rsi_entry_block})")
+                self.log_decision(symbol, "HOLD", f"RSI 과매수 매수 차단 (RSI={rsi_val:.1f} >= {rsi_entry_block})",
+                                  indicators, current_price, "SKIPPED")
+                # RSI 매도 신호는 보유 중일 때만 유효하므로, 매수 차단 후 SELL 여부도 반환
+                if rsi_sell:
+                    self.log_decision(symbol, "SELL", f"RSI 과매수 (RSI={indicators.get('rsi')} >= {self.rsi_exit_threshold})",
+                                      indicators, current_price, "EXECUTED")
+                    return "SELL", None
+                return "HOLD", None
 
             llm_active = getattr(settings, "USE_LLM_ADVISOR", False)
 
@@ -121,7 +135,14 @@ class VolatilityBreakout(Strategy):
                     k_effective = 0.45
                 indicators["k_effective"] = k_effective
                 indicators["prev_vol_ratio"] = round(prev_vol_ratio, 4)
-            target_price = today_open + volatility * k_effective
+            # LLM 사용 시 목표가 완화: K를 낮춰 돌파 신호를 더 많이 내고, 최종 필터는 LLM이 담당
+            k_for_target = k_effective
+            if llm_active:
+                relax = getattr(settings, "LLM_ENTRY_K_MULTIPLIER", 1.0) or 1.0
+                if 0 < relax < 1.0:
+                    k_for_target = k_effective * relax
+                    indicators["k_effective_llm_relaxed"] = round(k_for_target, 4)
+            target_price = today_open + volatility * k_for_target
             indicators["target_price"] = round(target_price, 2)
             indicators["volatility"] = round(volatility, 2)
 

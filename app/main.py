@@ -275,15 +275,18 @@ def _get_today_pl_and_assets():
 
 
 def _get_recent_trade_stats(window: int = 10) -> tuple[int, int, int]:
-    """최근 매도 거래 분석: (연속 손실 횟수, 윈도우 내 승수, 윈도우 내 패수) 반환.
+    """당일 매도 거래만으로 (연속 손실 횟수, 승수, 패수) 반환. 날이 바뀌면 자동 초기화(Lv0).
     연속 손실: 가장 최근 거래부터 연속으로 손실인 횟수.
-    승/패: 윈도우(기본 10건) 내 전체 승패 카운트 (복구 판단용).
+    승/패: 당일 SELL 체결 건 중 윈도우(기본 10건) 내 승패 카운트.
     """
+    KST = timezone(timedelta(hours=9))
+    today_start = datetime.now(KST).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).replace(tzinfo=None)
     db = session.SessionLocal()
     try:
         rows = (
             db.query(models.TradeLog)
             .filter(
+                models.TradeLog.timestamp >= today_start,
                 models.TradeLog.order_type == OrderType.SELL,
                 models.TradeLog.status == OrderStatus.EXECUTED,
             )
