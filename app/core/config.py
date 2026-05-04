@@ -61,8 +61,15 @@ class Settings(BaseSettings):
     ATR_PERIOD: int = 20
     ATR_MULTIPLIER: float = 1.2
     # 단계별 최대 손실폭 제한 (ATR 손절가가 너무 넓어도 이 비율에서 강제 손절)
-    MAX_LOSS_PCT_HALF: float = -5.0     # 매수가 대비 이 % 이하 → 보유량 1/2 손절
+    MAX_LOSS_PCT_HALF: float = -3.5     # 매수가 대비 이 % 이하 → 보유량 1/2 손절
     MAX_LOSS_PCT_FULL: float = -8.0     # 매수가 대비 이 % 이하 → 나머지 전량 손절
+
+    # 단계 익절 임계 (변동성 돌파: 작은 노이즈 흡수 + 추세 끝까지 추종)
+    STAGE1_TAKE_PROFIT_PCT: float = 7.0  # +N% 도달 시 1/3 익절 + 손절가를 본절 보호선으로 이동
+    STAGE2_TAKE_PROFIT_PCT: float = 9.0  # stage1 후 +N% 도달 시 추가 1/3 익절
+    # 본절 이동 시 손절가 보호 오프셋 (음수=매수가 아래 보호선, 0=정확히 본절)
+    # 예: -1.5 → purchase_price * 0.985 (작은 되돌림에 본절 청산되는 것 방지)
+    BREAKEVEN_OFFSET_PCT: float = -1.5
 
     # RSI 이익실현: 보유 중 RSI가 이 값 이상이면 SELL 신호 (0=비활성)
     RSI_EXIT_THRESHOLD: float = 70.0

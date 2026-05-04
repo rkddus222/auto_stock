@@ -525,7 +525,8 @@ def _run_trading_strategy_impl_locked():
                 stop_price = trade_status[symbol]["stop_price"]
                 quantity = trade_status[symbol]["quantity"]
 
-                # 3단계 익절: +5% 1/3 매도+본절 이동, +10% 추가 1/3 매도, 나머지 트레일링
+                # 3단계 익절: stage1 부분익절+보호선 이동, stage2 추가 1/3 매도, 나머지 트레일링
+                # 임계는 config (STAGE1/STAGE2_TAKE_PROFIT_PCT, BREAKEVEN_OFFSET_PCT)
                 purchase_price = trade_status[symbol].get("purchase_price", 0) or 0
                 initial_quantity = trade_status[symbol].get("initial_quantity", quantity)
                 # 최고가 추적 (트레일링/ATR 손절 기준점 — 현재가가 아닌 최고가 기준)
@@ -535,17 +536,23 @@ def _run_trading_strategy_impl_locked():
                     trade_status[symbol]["high_price"] = high_price
                 stage1_done = trade_status[symbol].get("stage1_sell_done", False)
                 stage2_done = trade_status[symbol].get("stage2_sell_done", False)
+                stage1_pct = getattr(settings, "STAGE1_TAKE_PROFIT_PCT", 7.0)
+                stage2_pct = getattr(settings, "STAGE2_TAKE_PROFIT_PCT", 9.0)
+                breakeven_offset_pct = getattr(settings, "BREAKEVEN_OFFSET_PCT", -1.5)
+                stage1_trigger = purchase_price * (1 + stage1_pct / 100)
+                stage2_trigger = purchase_price * (1 + stage2_pct / 100)
+                breakeven_stop = purchase_price * (1 + breakeven_offset_pct / 100)
                 if purchase_price <= 0:
                     pass
                 elif initial_quantity < 3:
                     # 보유 수량이 3주 미만이면 단계 익절 불가 → 트레일링 스톱에 맡김
                     if not stage1_done:
                         logger.debug(f"[{symbol}] 보유 {initial_quantity}주 → 단계 익절 스킵 (트레일링 스톱 유지)")
-                elif not stage1_done and current_price >= purchase_price * 1.05:
-                    # +5%: 1/3 매도 + 스톱 본절로 이동
+                elif not stage1_done and current_price >= stage1_trigger:
+                    # stage1 익절: 1/3 매도 + 손절가를 본절 보호선으로 이동
                     sell_qty = initial_quantity // 3
                     if sell_qty <= 0 or quantity < sell_qty:
-                        logger.debug(f"[{symbol}] +5% 도달했지만 단계 익절 수량 부족으로 stage1 유지 (보유={quantity}, 기준={sell_qty})")
+                        logger.debug(f"[{symbol}] +{stage1_pct}% 도달했지만 단계 익절 수량 부족으로 stage1 유지 (보유={quantity}, 기준={sell_qty})")
                         time.sleep(0.2)
                         continue
                     if sell_qty > 0 and quantity >= sell_qty:
@@ -557,7 +564,10 @@ def _run_trading_strategy_impl_locked():
                             res = kis_order.place_order(symbol=symbol, quantity=sell_qty, price=0, order_type="SELL")
                             pl = (current_price - purchase_price) * sell_qty
                             _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.EXECUTED, res, realized_pl=pl)
-                            send_slack_notification(f"[익절 1/3 +5%] {symbol} ({sell_qty}주) | 현재가: {current_price:.0f}, 스톱 본절 이동")
+                            send_slack_notification(
+                                f"[익절 1/3 +{stage1_pct}%] {symbol} ({sell_qty}주) | "
+                                f"현재가: {current_price:.0f}, 보호선 {breakeven_stop:.0f} ({breakeven_offset_pct:+.1f}%)"
+                            )
                             trade_status[symbol]["quantity"] = max(0, quantity - sell_qty)
                             queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": sell_qty})
                         except Exception as e:
@@ -565,14 +575,18 @@ def _run_trading_strategy_impl_locked():
                             logger.error(f"[{symbol}] 익절 1/3 매도 실패: {e}")
                             time.sleep(0.2)
                             continue
-                    trade_status[symbol]["stop_price"] = purchase_price
+                    # 보호선 이동: 정확한 본절(=매수가) 대신 BREAKEVEN_OFFSET_PCT만큼 아래로 둬서 노이즈 흡수
+                    trade_status[symbol]["stop_price"] = max(trade_status[symbol].get("stop_price", 0), breakeven_stop)
                     trade_status[symbol]["stage1_sell_done"] = True
-                    logger.info(f"[{symbol}] +5% 익절 1/3 처리, 손절가 본절로 이동 -> {purchase_price:.0f}")
+                    logger.info(
+                        f"[{symbol}] +{stage1_pct}% 익절 1/3 처리, 손절가 보호선 이동 -> {breakeven_stop:.0f} "
+                        f"({breakeven_offset_pct:+.1f}%)"
+                    )
                     save_trade_status()
                     time.sleep(0.2)
                     continue
-                elif stage1_done and not stage2_done and current_price >= purchase_price * 1.10:
-                    # +10%: 추가 1/3 매도
+                elif stage1_done and not stage2_done and current_price >= stage2_trigger:
+                    # stage2 익절: 추가 1/3 매도
                     sell_qty = initial_quantity // 3
                     remaining = trade_status[symbol]["quantity"]
                     sell_qty = min(sell_qty, remaining)
@@ -585,7 +599,7 @@ def _run_trading_strategy_impl_locked():
                             res = kis_order.place_order(symbol=symbol, quantity=sell_qty, price=0, order_type="SELL")
                             pl = (current_price - purchase_price) * sell_qty
                             _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.EXECUTED, res, realized_pl=pl)
-                            send_slack_notification(f"[익절 2/3 +10%] {symbol} ({sell_qty}주) | 현재가: {current_price:.0f}")
+                            send_slack_notification(f"[익절 2/3 +{stage2_pct}%] {symbol} ({sell_qty}주) | 현재가: {current_price:.0f}")
                             trade_status[symbol]["quantity"] = max(0, remaining - sell_qty)
                             queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": sell_qty})
                         except Exception as e:
