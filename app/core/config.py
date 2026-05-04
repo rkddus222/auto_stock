@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     MOCK_TRADE: bool = True
 
     # Strategy settings
-    VOLATILITY_BREAKOUT_K: float = 0.5
+    VOLATILITY_BREAKOUT_K: float = 0.55
     USE_ADAPTIVE_K: bool = True   # 변동성 돌파 전략에서 전일 변동성 기반 K 적용
     # 매매 시 예수금의 몇 %를 사용할지 (0~1, 예: 0.5 = 50%)
     BUDGET_RATIO: float = 0.5
@@ -53,12 +53,16 @@ class Settings(BaseSettings):
     DAILY_LOSS_LIMIT_PCT: float = -4.0   # 당일 실현손실이 총자산 대비 이 % 이하면 신규 매수 중단
     MAX_CONSECUTIVE_LOSSES: int = 4      # 이 횟수 연패 시 슬롯 축소 + 예산 축소
     BUDGET_CUT_ON_STREAK: float = 0.7    # 연패 시 적용할 예산 비율 (0.7 = 70%)
-    MAX_DAILY_TRADES: int = 20           # 당일 체결 건수(BUY+SELL) 이하면 신규 매수 허용 (초과 시 신규 매수만 중단)
+    MAX_DAILY_TRADES: int = 10           # 당일 체결 건수(BUY+SELL) 이하면 신규 매수 허용 (초과 시 신규 매수만 중단)
+    SAME_DAY_REENTRY: bool = False       # True=당일 매도 종목 재매수 허용, False=차단
 
     # ATR 손절 (변동성 돌파 전략)
-    USE_ATR_STOP: bool = False          # True 시 ATR 기반 손절, False 시 기존 trailing_stop_pct
+    USE_ATR_STOP: bool = True           # True 시 ATR 기반 손절, False 시 기존 trailing_stop_pct
     ATR_PERIOD: int = 20
-    ATR_MULTIPLIER: float = 1.5
+    ATR_MULTIPLIER: float = 1.2
+    # 단계별 최대 손실폭 제한 (ATR 손절가가 너무 넓어도 이 비율에서 강제 손절)
+    MAX_LOSS_PCT_HALF: float = -5.0     # 매수가 대비 이 % 이하 → 보유량 1/2 손절
+    MAX_LOSS_PCT_FULL: float = -8.0     # 매수가 대비 이 % 이하 → 나머지 전량 손절
 
     # RSI 이익실현: 보유 중 RSI가 이 값 이상이면 SELL 신호 (0=비활성)
     RSI_EXIT_THRESHOLD: float = 70.0
@@ -72,6 +76,7 @@ class Settings(BaseSettings):
 
     # 매수 주문 방식: 0=시장가, N>0=현재가+N호가 지정가
     BUY_PRICE_TICK_OFFSET: int = 2       # 매수 시 현재가 + N호가 (0=시장가)
+    ENTRY_MAX_BREAKOUT_SLIPPAGE_PCT: float = 2.0  # 목표가 돌파 후 이 % 이상 더 오른 구간은 추격매수 금지
 
     # 종목 스코어링 (동적 종목 사용 시 상위 N개만 진입)
     USE_STOCK_SCORING: bool = False      # True 시 후보를 스코어로 정렬 후 상위 MAX_SLOTS만
@@ -85,7 +90,13 @@ class Settings(BaseSettings):
     VERTEX_REGION: str = "asia-northeast3" # Vertex AI 리전 (서울)
     LLM_MAX_DAILY_CALLS: int = 50        # 일일 최대 LLM 호출 횟수
     LLM_REJECT_COOLDOWN: int = 1800       # LLM 매수 거부 시 해당 종목 재시도 대기(초), 기본 30분
-    LLM_ENTRY_K_MULTIPLIER: float = 0.9   # LLM 사용 시 돌파 목표가 완화 (1.0=기본, 0.9=목표가 10% 낮춤 → 신호 증가, LLM이 최종 필터)
+    LLM_ENTRY_K_MULTIPLIER: float = 0.7   # LLM 사용 시 돌파 목표가 완화 (1.0=기본, 0.7=목표가 30% 낮춤 → 신호 증가, LLM이 최종 필터)
+    # LLM API 429(요청 한도 초과) 시 매수 보류 대신 기술적 지표 기반 폴백 모드로 전환
+    # True: RSI/돌파 강도 등 기술 지표만으로 통과 여부 판단 (기회 손실 최소화)
+    # False: 기존 동작 — 매수 보류 (안전 우선)
+    LLM_FALLBACK_ON_429: bool = True
+    # 폴백 모드에서 RSI가 이 값 이상이면 매수 거부 (과매수 방어)
+    LLM_FALLBACK_RSI_BLOCK: float = 75.0
 
     # 데이터/상태 파일 기준 디렉터리 (비우면 프로젝트 루트)
     DATA_DIR: str = ""

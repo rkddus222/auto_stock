@@ -33,7 +33,8 @@ def get_current_price(symbol: str) -> float:
     except APIRequestError:
         raise
     except Exception as e:
-        logger.error(f"현재가 조회 중 에러: {e}")
+        # retry 데코레이터가 WARNING으로 재시도 사실을 출력하므로 여기서는 DEBUG로만 남긴다
+        logger.debug(f"현재가 조회 중 에러: {e}")
         raise APIRequestError(str(e))
 
 
@@ -71,7 +72,7 @@ def get_daily_ohlcv(symbol: str, days: int = 30):
     except APIRequestError:
         raise
     except Exception as e:
-        logger.error(f"일봉 데이터 조회 중 에러: {e}")
+        logger.debug(f"일봉 데이터 조회 중 에러: {e}")
         raise APIRequestError(str(e))
 
 
@@ -102,7 +103,7 @@ def get_index_price(index_code: str = "1001") -> float:
     except APIRequestError:
         raise
     except Exception as e:
-        logger.error(f"지수 현재가 조회 중 에러: {e}")
+        logger.debug(f"지수 현재가 조회 중 에러: {e}")
         raise APIRequestError(str(e))
 
 
@@ -143,5 +144,5 @@ def get_index_daily(index_code: str = "1001", days: int = 10) -> list:
     except APIRequestError:
         raise
     except Exception as e:
-        logger.error(f"지수 일봉 조회 중 에러: {e}")
+        logger.debug(f"지수 일봉 조회 중 에러: {e}")
         raise APIRequestError(str(e))

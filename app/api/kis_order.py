@@ -1,3 +1,5 @@
+import time
+
 from app.api.kis_auth import kis_auth
 from app.api.kis_http import kis_get, kis_post
 from app.api.kis_retry import kis_retry, rate_limited
@@ -128,6 +130,55 @@ def place_order(symbol: str, quantity: int, price: int, order_type: str):
         raise APIRequestError(str(e))
 
 
+def get_holding_quantity(symbol: str) -> int:
+    """
+    KIS 잔고에서 특정 종목의 실제 보유수량을 조회한다. 미보유면 0.
+    매수 직후 동기화 확인, 매도 직전 수량 가드용 헬퍼.
+    """
+    try:
+        holdings = get_balance()
+    except Exception as e:
+        logger.warning(f"[{symbol}] 보유수량 조회 실패 (0 반환): {e}")
+        return 0
+    if not holdings:
+        return 0
+    for item in holdings:
+        if item.get("pdno") == symbol:
+            try:
+                return int(item.get("hldg_qty", 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def wait_for_holding_at_least(
+    symbol: str,
+    min_qty: int,
+    timeout: float = 15.0,
+    interval: float = 1.5,
+) -> int:
+    """
+    KIS 잔고에 symbol의 보유수량이 min_qty 이상이 될 때까지 폴링한다.
+    매수 체결 직후 KIS 잔고 반영 지연으로 인한 후속 매도 실패를 방지하기 위함.
+    timeout 안에 도달하지 못하면 마지막 조회 수량을 그대로 반환 (오류 발생시키지 않음).
+    """
+    if min_qty <= 0:
+        return get_holding_quantity(symbol)
+    deadline = time.time() + max(timeout, 0)
+    last_qty = 0
+    while True:
+        last_qty = get_holding_quantity(symbol)
+        if last_qty >= min_qty:
+            return last_qty
+        if time.time() >= deadline:
+            logger.warning(
+                f"[{symbol}] 보유수량 동기화 timeout: KIS={last_qty} < 기대={min_qty} "
+                f"({timeout:.0f}초 대기). 후속 매도는 실제 보유수량으로 클램프됨."
+            )
+            return last_qty
+        time.sleep(interval)
+
+
 @kis_retry
 @rate_limited
 def get_balance():
@@ -167,7 +218,8 @@ def get_balance():
     except APIRequestError:
         raise
     except Exception as e:
-        logger.error(f"잔고 조회 중 에러: {e}")
+        # retry 데코레이터가 WARNING으로 재시도 사실을 출력하므로 여기서는 DEBUG로만 남긴다
+        logger.debug(f"잔고 조회 중 에러: {e}")
         raise APIRequestError(str(e))
 
 
@@ -269,5 +321,118 @@ def get_cash_balance():
     except APIRequestError:
         raise
     except Exception as e:
-        logger.error(f"예수금 조회 중 에러: {e}")
+        logger.debug(f"예수금 조회 중 에러: {e}")
+        raise APIRequestError(str(e))
+
+
+def _psbl_order_tr_id() -> str:
+    """매수가능금액조회 tr_id: 모의투자 VTTC8908R, 실전 TTTC8908R"""
+    return "VTTC8908R" if settings.MOCK_TRADE else "TTTC8908R"
+
+
+@kis_retry
+@rate_limited
+def get_orderable_cash_balance() -> int:
+    """
+    매수가능금액 전용 API(inquire-psbl-order)로 주문가능현금을 조회합니다.
+    이 API는 미체결 주문·수수료·증거금을 차감한 실제 주문가능금액을 반환합니다.
+    실패 시 기존 잔고조회(inquire-balance) 예수금으로 폴백합니다.
+    """
+    # 1차: 매수가능금액 전용 API
+    try:
+        orderable = _get_orderable_from_psbl_order_api()
+        if orderable > 0:
+            return orderable
+    except Exception as e:
+        logger.debug(f"매수가능금액 전용 API 실패, 잔고조회 폴백: {e}")
+
+    # 2차: 기존 잔고조회 폴백
+    return _get_orderable_from_balance_api()
+
+
+def _get_orderable_from_psbl_order_api() -> int:
+    """inquire-psbl-order API로 실제 주문가능금액을 조회한다."""
+    path = "/uapi/domestic-stock/v1/trading/inquire-psbl-order"
+    url = f"{kis_auth.base_url}{path}"
+    cano, acnt_prdt_cd = _get_account_parts()
+    headers = {
+        "Content-Type": "application/json",
+        "authorization": f"Bearer {kis_auth.access_token}",
+        "appKey": kis_auth._app_key,
+        "appSecret": kis_auth._app_secret,
+        "tr_id": _psbl_order_tr_id(),
+    }
+    params = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": acnt_prdt_cd,
+        "PDNO": "005930",        # 임의 종목 (금액 조회용, 종목 무관)
+        "ORD_UNPR": "0",         # 시장가 (0)
+        "ORD_DVSN": "01",        # 시장가 주문
+        "CMA_EVLU_AMT_ICLD_YN": "Y",  # CMA 평가금액 포함
+        "OVRS_ICLD_YN": "N",
+    }
+    response = kis_get(url, headers=headers, params=params)
+    res = response.json()
+    if res.get("rt_cd") != "0":
+        raise APIRequestError(f"매수가능금액 조회 실패: {res.get('msg1', '')}")
+
+    output = res.get("output", {})
+    logger.debug(f"매수가능금액 API output 필드: {list(output.keys())}")
+
+    # nrcvb_buy_amt: 미수 없는 매수가능금액 (가장 보수적이고 정확)
+    # ord_psbl_cash: 주문가능현금
+    # max_buy_amt: 최대 매수 가능 금액
+    for key in ("nrcvb_buy_amt", "ord_psbl_cash", "max_buy_amt"):
+        val = output.get(key)
+        if val is not None and str(val).strip() not in ("", "0"):
+            amt = int(val)
+            if amt > 0:
+                logger.debug(f"매수가능금액: {amt:,}원 (출처: {key})")
+                return amt
+    return 0
+
+
+def _get_orderable_from_balance_api() -> int:
+    """기존 잔고조회 API(inquire-balance)에서 주문가능금액을 추출한다 (폴백용)."""
+    path = "/uapi/domestic-stock/v1/trading/inquire-balance"
+    url = f"{kis_auth.base_url}{path}"
+    cano, acnt_prdt_cd = _get_account_parts()
+    headers = {
+        "Content-Type": "application/json",
+        "authorization": f"Bearer {kis_auth.access_token}",
+        "appKey": kis_auth._app_key,
+        "appSecret": kis_auth._app_secret,
+        "tr_id": _balance_tr_id(),
+    }
+    base_params = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": acnt_prdt_cd,
+        "AFHR_FLPR_YN": "N",
+        "OFL_YN": "",
+        "UNPR_DVSN": "01",
+        "FUND_STTL_ICLD_YN": "N",
+        "FNCG_AMT_AUTO_RDPT_YN": "N",
+        "PRCS_DVSN": "01",
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": "",
+    }
+
+    try:
+        for inqr_dvsn in ("01", "02"):
+            params = {**base_params, "INQR_DVSN": inqr_dvsn}
+            response = kis_get(url, headers=headers, params=params)
+            res = response.json()
+            if res.get("rt_cd") != "0":
+                continue
+            orderable = _parse_orderable_from_balance_response(res)
+            if orderable > 0:
+                return orderable
+            cash = _parse_cash_from_balance_response(res)
+            if cash > 0:
+                return cash
+        return 0
+    except APIRequestError:
+        raise
+    except Exception as e:
+        logger.debug(f"주문가능현금 조회 중 에러: {e}")
         raise APIRequestError(str(e))

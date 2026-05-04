@@ -228,6 +228,7 @@ def _build_prompt(
     indicators: dict,
     ohlcv_recent: list[dict],
     strategy_reason: str,
+    news_text: str = "",
 ) -> str:
     # OHLCV 테이블
     ohlcv_lines = []
@@ -244,10 +245,13 @@ def _build_prompt(
     # 파생 지표
     derived = _derive_ohlcv_metrics(ohlcv_recent, current_price)
 
-    return f"""당신은 한국 주식시장(KRX) 전문 트레이더이자 리스크 매니저입니다.
-자동매매 시스템의 변동성 돌파 전략이 아래 종목에 대해 BUY 신호를 발생시켰습니다.
-당신의 역할은 이 신호를 **2차 검증**하여 "지금 진입해도 되는가"를 판단하는 것입니다.
-매수 후 수분~수시간 보유하는 단타/스윙 관점으로 분석하세요.
+    return f"""당신은 한국 주식시장(KRX) **변동성 돌파(Volatility Breakout) 전략** 전문 트레이더입니다.
+
+【전략 특성 — 반드시 숙지】
+변동성 돌파 전략은 "당일 시가 + 전일 변동폭 × K"를 돌파할 때 진입하는 **모멘텀 추종** 전략입니다.
+따라서 진입 시점에 시가 대비 수 퍼센트 상승은 **정상적인 돌파 신호**이며, 이것만으로 "추격 매수"로 판단해서는 안 됩니다.
+핵심 검증 포인트는 ①돌파가 진짜인가(거래량 동반), ②추가 상승 여력이 있는가(과매수 아닌가)입니다.
+당신의 역할은 **명백히 위험한 진입만 걸러내는 것**이지, 완벽한 진입만 허용하는 것이 아닙니다.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ■ 종목: {symbol}
@@ -264,46 +268,88 @@ def _build_prompt(
 【최근 5일 OHLCV (최신→과거 순)】
 {ohlcv_text}
 
+【최근 뉴스】
+{news_text if news_text else "뉴스 데이터 없음"}
+
 ━━━━━━━━━━ 판단 체크리스트 ━━━━━━━━━━
-아래 7개 항목을 순서대로 평가하고, 종합하여 최종 판단하세요.
+아래 8개 항목을 평가하되, 각 항목의 **가중치가 다름**에 유의하세요.
+★ = 핵심 지표 (이것이 긍정이면 다른 경미한 부정은 상쇄 가능)
+○ = 보조 지표 (단독으로 SKIP 사유가 되기 어려움)
 
-1. **추세 정렬**: 현재가 > 20일 이동평균(MA)인가? MA 위에서 돌파하는 것이 정석.
-   - MA 아래에서 돌파 시도 → 신뢰도 낮음
+★1. **돌파 강도**: 현재가가 목표가(target_price)를 얼마나 상회하는가?
+   - 목표가 대비 0.3% 미만 → 가돌파 위험 (부정)
+   - 0.3~1% → 보통
+   - 1% 이상 → 강한 돌파 (긍정)
 
-2. **돌파 강도**: 현재가가 목표가(target_price)를 얼마나 상회하는가?
-   - 목표가 대비 0.5% 미만 → 가돌파(fake breakout) 위험
-   - 1% 이상 상회 → 돌파 신뢰도 높음
+★2. **거래량 확인**: 오늘 거래량이 최근 5일 평균 대비 몇 배인가?
+   - 1.5배 이상 → 실질 돌파, 강한 긍정
+   - 1.0~1.5배 → 보통 (다른 지표 참고)
+   - 1.0배 미만 → 거래량 미동반, 부정
 
-3. **거래량 확인**: 오늘 거래량이 최근 5일 평균 대비 몇 배인가?
-   - 1.5배 이상 → 돌파에 거래량 동반, 긍정적
-   - 1배 미만 → 거래량 미동반 돌파, 지속력 의심
+○3. **추세 정렬**: 현재가 > 20일 이동평균(MA)인가?
+   - MA 위 → 긍정
+   - MA 아래 → 약한 부정 (단, 강한 돌파+거래량이면 무시 가능)
 
-4. **과매수 경계**: RSI 값 확인
-   - RSI ≤ 65 → 안전 구간
-   - 65 < RSI < 75 → 주의 (다른 지표가 강하면 진입 가능)
-   - RSI ≥ 75 → 과매수, SKIP 강력 권고
+○4. **과매수 경계**: RSI 값 확인
+   - RSI ≤ 70 → 정상 범위
+   - 70 < RSI < 80 → 주의 (돌파 강도가 강하면 진입 가능)
+   - RSI ≥ 80 → 과매수, 부정
 
-5. **추격 매수 위험**: 당일 시가 대비 상승률(intraday_change_pct) 확인
-   - 5% 미만 → 적정
-   - 5~8% → 주의 (확신도 높을 때만 진입)
-   - 8% 이상 → 고점 추격 위험 높음, SKIP 권고
+○5. **당일 상승폭**: 시가 대비 상승률(intraday_change_pct)
+   - 10% 미만 → 변동성 돌파의 정상 범위
+   - 10~15% → 주의 (거래량 2배 이상이면 허용)
+   - 15% 이상 → 과열, 부정
 
-6. **연속 상승 피로**: 며칠째 연속 상승 중인가?
-   - 1~2일 → 초기 상승, 긍정적
-   - 3일 이상 연속 상승 → 차익 매물 출회 가능, 주의
+○6. **연속 상승**: 며칠째 연속 상승 중인가?
+   - 1~3일 → 모멘텀 초기~중기, 정상
+   - 4일 이상 → 차익 실현 압력 가능, 약한 부정
+   - 5일 이상 → 부정
 
-7. **캔들 형태**: 오늘 캔들이 양봉인가? 윗꼬리가 길지 않은가?
-   - 양봉 + 윗꼬리 짧음(30% 미만) → 매수세 우위, 긍정적
-   - 윗꼬리 40% 이상 → 매도 압력 존재, 주의
+○7. **캔들 형태**: 양봉인가? 윗꼬리 비율은?
+   - 양봉 + 윗꼬리 40% 미만 → 매수세 우위
+   - 윗꼬리 50% 이상 → 매도 압력, 약한 부정
+
+○8. **뉴스 센티먼트**: 최근 뉴스 헤드라인에서 해당 종목에 대한 긍/부정 신호
+   - 실적 호조, 수주, 신사업, 외국인 매수 등 → 긍정
+   - 실적 부진, 소송, 규제, 대량 매도 등 → 부정
+   - 뉴스 없음 또는 중립 → 무시 (판단에 영향 없음)
+   - 뉴스만으로 단독 BUY/SKIP 결정 불가, 보조 참고 자료로만 활용
 
 ━━━━━━━━━━ 의사결정 규칙 ━━━━━━━━━━
-- 7개 중 **부정 신호가 3개 이상**이면 → SKIP
-- 7개 중 **부정 신호가 2개 이하**이고 돌파 강도 + 거래량이 긍정이면 → BUY
-- 판단이 애매하면 → SKIP (보수적 운용 원칙: 놓치는 것보다 잘못 사는 것이 더 나쁘다)
+1. ★핵심 지표(돌파 강도 + 거래량)가 **둘 다 긍정**이면 → 보조 지표에 부정이 2~3개 있어도 **BUY** (모멘텀 전략의 핵심이 충족됨)
+2. ★핵심 지표 중 하나라도 **부정**이면 → 보조 지표까지 종합 판단
+3. 보조 지표(3~8번)에서 **부정이 4개 이상**이면 → SKIP
+4. RSI ≥ 80 또는 당일 상승 15% 이상 → 단독 SKIP 사유
+5. 판단이 애매하면 → **BUY** (변동성 돌파 전략은 승률보다 손익비가 중요, 손절은 ATR로 관리됨)
 
 ━━━━━━━━━━ 응답 형식 ━━━━━━━━━━
 아래 JSON만 출력하세요. 다른 텍스트는 절대 포함하지 마세요.
 {{"decision": "BUY" 또는 "SKIP", "confidence": 0~100 정수, "reason": "체크리스트 결과 요약 (어떤 항목이 긍정/부정이었는지 간결하게)"}}"""
+
+
+def _technical_fallback_decision(
+    symbol: str,
+    current_price: float,
+    indicators: dict,
+) -> tuple[bool, str]:
+    """
+    LLM 호출 실패(429 등) 시 기술적 지표만으로 매수 가부를 판단하는 폴백 모드.
+    LLM이 차단하던 RSI 과매수 케이스만 거부하고, 그 외는 통과시켜 기회 손실을 최소화한다.
+    """
+    rsi_block = getattr(settings, "LLM_FALLBACK_RSI_BLOCK", 75.0)
+    rsi_val = indicators.get("rsi")
+    try:
+        rsi_num = float(rsi_val) if rsi_val is not None else None
+    except (TypeError, ValueError):
+        rsi_num = None
+    if rsi_num is not None and rsi_block > 0 and rsi_num >= rsi_block:
+        reason = f"폴백: RSI 과매수 차단 (RSI={rsi_num:.1f} >= {rsi_block})"
+        _log_decision(symbol, "FALLBACK_SKIP", 0, reason, current_price, "REJECTED")
+        return False, reason
+    rsi_str = f"{rsi_num:.1f}" if rsi_num is not None else "N/A"
+    reason = f"폴백 승인 (LLM 미가용 → 기술 지표만 검증, RSI={rsi_str})"
+    _log_decision(symbol, "FALLBACK_BUY", 0, reason, current_price, "APPROVED_FALLBACK")
+    return True, reason
 
 
 def _log_decision(
@@ -420,7 +466,16 @@ def should_buy(
         logger.warning(f"[LLM] 일일 호출 한도 초과 ({_daily_call_count}/{settings.LLM_MAX_DAILY_CALLS}), 매수 허용")
         return True, "LLM 일일 호출 한도 초과 (fail-open)"
 
-    prompt = _build_prompt(symbol, current_price, indicators, ohlcv_recent, strategy_reason)
+    # 뉴스 수집 (실패해도 매수 판단에 영향 없음)
+    news_text = ""
+    try:
+        from app.services.news import fetch_stock_news, format_news_for_prompt
+        news_list = fetch_stock_news(symbol, max_count=5)
+        news_text = format_news_for_prompt(news_list)
+    except Exception as e:
+        logger.debug(f"[LLM] {symbol} 뉴스 수집 실패 (무시): {e}")
+
+    prompt = _build_prompt(symbol, current_price, indicators, ohlcv_recent, strategy_reason, news_text)
 
     # 연속 호출 시 최소 간격 보장 (429 방지)
     global _last_call_ts
@@ -454,8 +509,13 @@ def should_buy(
 
             _daily_call_count += 1
 
-            # 429 Rate Limit → 매수 보류 (fail-close)
+            # 429 Rate Limit → 폴백 모드 (활성 시) 또는 매수 보류
             if resp.status_code == 429:
+                if getattr(settings, "LLM_FALLBACK_ON_429", False):
+                    logger.warning(
+                        f"[LLM] {symbol} API 요청 한도 초과 (429, {backend}) → 기술 지표 폴백 모드"
+                    )
+                    return _technical_fallback_decision(symbol, current_price, indicators)
                 logger.warning(f"[LLM] {symbol} API 요청 한도 초과 (429, {backend}), 매수 보류")
                 _log_decision(symbol, "RATE_LIMITED", 0, f"API 429 ({backend})", current_price, "REJECTED")
                 return False, f"LLM API 요청 한도 초과 ({backend}, 매수 보류)"

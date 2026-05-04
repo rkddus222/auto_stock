@@ -53,11 +53,37 @@ _pending_broadcasts: list[dict] = []
 _broadcast_lock = threading.Lock()
 # 매매 job 중복 실행 방지: job은 10초마다 호출되지만, 실제 로직은 한 번에 하나만 실행
 _trading_job_lock = threading.Lock()
+# 모든 trade_status mutate/write를 보호하는 공용 lock (reconciliation 등 다른 모듈도 import해 사용)
+from app.core.trade_state_lock import trade_state_lock as _trade_state_lock  # noqa: E402
 # 매수 실패 시 종목별 쿨다운 (symbol -> 쿨다운 만료 시각 epoch)
 _buy_cooldown: dict[str, float] = {}
 _BUY_COOLDOWN_SECONDS = 300  # 5분
+# 거래 자체가 정책상 막힌 종목(기본예탁금/파생ETF/종목코드 오류 등) — 당일 동안 매수 영구 차단
+_DAILY_BUY_BLACKLIST: set[str] = set()
+# 위 사유에 매칭될 KIS 응답 메시지 키워드
+_PERMANENT_REJECT_KEYWORDS = (
+    "기본예탁금",     # 기본예탁금 미충족 (462330 등 ETF/ETN)
+    "파생ETF",        # 파생ETF 선택확인서 미신청
+    "선택확인서",     # 위와 유사
+    "거래정지",       # 거래정지 종목
+    "관리종목",       # 관리종목 매수 제한
+    "투자위험",       # 투자위험·경고종목
+    "정리매매",       # 정리매매 종목
+    "단일가",         # 단일가매매 시간대 외
+    "종목코드",       # 잘못된 종목코드 (영구 오류)
+    "취급불가",       # 거래 취급불가 종목
+)
+
+
+def _is_permanent_reject(error_msg: str) -> bool:
+    """KIS 응답 메시지가 당일 재시도해도 실패할 정책성 거부인지 판별."""
+    if not error_msg:
+        return False
+    return any(kw in error_msg for kw in _PERMANENT_REJECT_KEYWORDS)
 # LLM 매수 거부 시 종목별 쿨다운 (symbol -> 쿨다운 만료 시각 epoch)
 _llm_reject_cooldown: dict[str, float] = {}
+# 당일 매도 종목 재진입 방지 (매일 아침 초기화)
+_daily_sold_symbols: set[str] = set()
 
 DEFAULT_STRATEGY_NAME = "volatility_breakout"
 DEFAULT_STRATEGY_PARAMS = {"ma_period": 20, "trailing_stop_pct": 4.0, "k": getattr(settings, "VOLATILITY_BREAKOUT_K", 0.5)}
@@ -65,6 +91,7 @@ DEFAULT_STRATEGY_PARAMS = {"ma_period": 20, "trailing_stop_pct": 4.0, "k": getat
 # 지수 필터 캐시 (매 사이클마다 API 호출 방지, 60초 유효)
 _market_filter_cache: dict = {"ok": True, "ts": 0.0, "reason": ""}
 _MARKET_FILTER_TTL = 60  # 초
+_EMPTY_POSITION = {"bought": False, "purchase_price": 0.0, "quantity": 0, "stop_price": 0.0}
 
 
 def _get_tick_size(price: float) -> int:
@@ -91,6 +118,61 @@ def _calc_buy_limit_price(current_price: float, tick_offset: int = 2) -> int:
         return 0
     tick = _get_tick_size(current_price)
     return int(current_price + tick * tick_offset)
+
+
+def _clear_position(symbol: str):
+    """보유 포지션 상태를 초기화합니다."""
+    trade_status[symbol] = dict(_EMPTY_POSITION)
+
+
+def _resolve_sell_quantity(symbol: str, requested_qty: int) -> int:
+    """
+    매도 직전 KIS 실보유수량으로 요청 수량을 클램프한다.
+    KIS 잔고가 0이면 로컬 포지션을 정리하고 0을 반환 → 호출부에서 매도 스킵.
+    KIS 보유 < 요청이면 KIS 보유로 줄여서 "주문가능수량 초과" 오류를 사전 방지.
+    """
+    if requested_qty <= 0:
+        return 0
+    actual_qty = kis_order.get_holding_quantity(symbol)
+    if actual_qty <= 0:
+        logger.warning(f"[{symbol}] 매도 요청({requested_qty}주)이나 KIS 보유=0 → 로컬 포지션 정리 후 스킵")
+        _clear_position(symbol)
+        save_trade_status()
+        return 0
+    if actual_qty < requested_qty:
+        logger.warning(
+            f"[{symbol}] 매도 수량 클램프: 요청={requested_qty}주 → KIS 실보유={actual_qty}주"
+        )
+        return actual_qty
+    return requested_qty
+
+
+def _estimate_buy_execution_price(symbol: str, requested_price: int, fallback_price: float, quantity: int) -> float:
+    """
+    매수 체결가를 보수적으로 추정합니다.
+    1) 잔고조회 평균단가
+    2) 지정가 주문가
+    3) 신호 시점 가격
+    """
+    try:
+        position = reconciliation_service.get_balance_position(symbol)
+        avg_price = reconciliation_service.extract_average_price(position)
+        if avg_price and avg_price > 0:
+            return avg_price
+    except Exception as e:
+        logger.debug(f"[{symbol}] 매수 체결가 추정용 잔고 조회 실패: {e}")
+    if requested_price and requested_price > 0:
+        return float(requested_price)
+    return float(fallback_price)
+
+
+def _compute_buy_budget(slot_limit: int, base_ratio: float, budget_multiplier: float = 1.0) -> tuple[float, int, int]:
+    """주문가능현금 기준으로 종목당 매수 예산을 계산합니다."""
+    cash_balance = kis_order.get_orderable_cash_balance()
+    current_holdings = sum(1 for st in trade_status.values() if st.get("bought"))
+    open_slots = max(1, slot_limit - current_holdings)
+    budget_per_stock = (cash_balance * base_ratio * budget_multiplier) / open_slots
+    return budget_per_stock, current_holdings, cash_balance
 
 
 def _check_market_filter() -> tuple[bool, str]:
@@ -184,10 +266,11 @@ def get_strategy_for_symbol(symbol: str):
 
 # --- State Persistence Functions ---
 def save_trade_status():
-    """거래 상태를 JSON 파일에 저장합니다."""
-    TRADE_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(TRADE_STATUS_FILE, "w", encoding="utf-8") as f:
-        json.dump(trade_status, f, indent=4, ensure_ascii=False)
+    """거래 상태를 JSON 파일에 저장합니다. (스레드 안전 — 공용 lock 보유)"""
+    with _trade_state_lock:
+        TRADE_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(TRADE_STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump(trade_status, f, indent=4, ensure_ascii=False)
 
 
 def load_trade_status():
@@ -274,41 +357,26 @@ def _get_today_pl_and_assets():
         return today_pl, None
 
 
-def _get_recent_trade_stats(window: int = 10) -> tuple[int, int, int]:
-    """당일 매도 거래만으로 (연속 손실 횟수, 승수, 패수) 반환. 날이 바뀌면 자동 초기화(Lv0).
-    연속 손실: 가장 최근 거래부터 연속으로 손실인 횟수.
-    승/패: 당일 SELL 체결 건 중 윈도우(기본 10건) 내 승패 카운트.
-    """
-    KST = timezone(timedelta(hours=9))
-    today_start = datetime.now(KST).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).replace(tzinfo=None)
-    db = session.SessionLocal()
-    try:
-        rows = (
-            db.query(models.TradeLog)
-            .filter(
-                models.TradeLog.timestamp >= today_start,
-                models.TradeLog.order_type == OrderType.SELL,
-                models.TradeLog.status == OrderStatus.EXECUTED,
-            )
-            .order_by(models.TradeLog.timestamp.desc())
-            .limit(window)
-            .all()
-        )
-        consecutive = 0
-        wins = 0
-        losses = 0
-        for i, r in enumerate(rows):
-            if (r.realized_pl or 0) < 0:
-                losses += 1
-                if i == consecutive:  # 아직 연속 손실 중
-                    consecutive += 1
-            else:
-                wins += 1
-        return consecutive, wins, losses
-    except Exception:
-        return 0, 0, 0
-    finally:
-        db.close()
+def _get_portfolio_pl(include_unrealized: bool = False) -> tuple[float, float | None]:
+    """당일 실현손익(옵션으로 평가손익 포함)과 총자산을 반환합니다."""
+    realized_pl, total_assets = _get_today_pl_and_assets()
+    if not include_unrealized or total_assets is None:
+        return realized_pl, total_assets
+
+    unrealized_pl = 0.0
+    for sym, st in trade_status.items():
+        if not st.get("bought"):
+            continue
+        qty = st.get("quantity", 0) or 0
+        purchase_price = st.get("purchase_price", 0) or 0
+        if qty <= 0 or purchase_price <= 0:
+            continue
+        try:
+            current_price = kis_market.get_current_price(sym)
+            unrealized_pl += (current_price - purchase_price) * qty
+        except Exception:
+            continue
+    return realized_pl + unrealized_pl, total_assets
 
 
 def _get_today_trade_count() -> int:
@@ -378,6 +446,13 @@ def run_trading_strategy():
 def _run_trading_strategy_impl():
     """run_trading_strategy 실제 로직 (락 획득 후 호출)."""
     global target_symbols, _last_slot_scan_time
+    with _trade_state_lock:
+        _run_trading_strategy_impl_locked()
+
+
+def _run_trading_strategy_impl_locked():
+    """trade_status 락을 보유한 상태에서 실행되는 자동매매 로직."""
+    global target_symbols, _last_slot_scan_time
 
     # --- 빈 자리 채우기: 동적 종목(거래량/조건검색) 사용 시, 슬롯 제한 및 주기 재검색 ---
     use_dynamic = settings.USE_VOLUME_RANK or settings.USE_CONDITION_SEARCH
@@ -417,18 +492,17 @@ def _run_trading_strategy_impl():
 
     logger.debug("자동 매매 로직 실행: 매수 및 트레일링 스톱 모니터링")
     try:
-        cash_balance = kis_order.get_cash_balance()
         ratio = max(0.01, min(1.0, settings.BUDGET_RATIO))
-        current_holdings = sum(1 for st in trade_status.values() if st.get("bought"))
-        open_slots = max(1, (settings.MAX_SLOTS or 3) - current_holdings)
-        budget_per_stock = (cash_balance * ratio) / open_slots
+        effective_max_slots = settings.MAX_SLOTS or 3
+        budget_multiplier = 1.0
+        budget_per_stock, current_holdings, cash_balance = _compute_buy_budget(effective_max_slots, ratio)
     except Exception as e:
-        logger.error(f"예수금 조회 실패: {e}")
+        logger.error(f"주문가능현금 조회 실패: {e}")
         return
 
     # 일별 리스크: 손실 한도 / 연패 / 일일 매매 횟수
     no_new_buy = False
-    today_pl, total_assets = _get_today_pl_and_assets()
+    today_pl, total_assets = _get_portfolio_pl(include_unrealized=True)
     loss_limit_pct = getattr(settings, "DAILY_LOSS_LIMIT_PCT", -2.0)
     if total_assets and total_assets > 0 and loss_limit_pct < 0:
         if (today_pl / total_assets * 100) <= loss_limit_pct:
@@ -440,37 +514,6 @@ def _run_trading_strategy_impl():
         if max_trades > 0 and today_trades >= max_trades:
             no_new_buy = True
             logger.debug(f"일일 매매 횟수 한도 ({today_trades} >= {max_trades}) → 신규 매수 중단")
-    if not no_new_buy:
-        consec_losses, recent_wins, recent_losses = _get_recent_trade_stats(10)
-        max_streak = getattr(settings, "MAX_CONSECUTIVE_LOSSES", 4) or 0
-        max_slots_orig = settings.MAX_SLOTS or 3
-        budget_cut_ratio = getattr(settings, "BUDGET_CUT_ON_STREAK", 0.7)
-        total_recent = recent_wins + recent_losses
-        win_rate = recent_wins / max(1, total_recent)
-
-        if max_streak > 0 and consec_losses >= max_streak:
-            # Level 2 (SEVERE): 활성 연패 중 → 슬롯 절반 + 예산 축소
-            reduced_slots = max(1, max_slots_orig // 2)
-            if current_holdings >= reduced_slots:
-                no_new_buy = True
-                logger.info(f"[리스크 Lv2] 연패 {consec_losses}회 → 슬롯 {max_slots_orig}→{reduced_slots}, 보유 {current_holdings}개 → 매수 중단")
-            else:
-                open_slots = max(1, reduced_slots - current_holdings)
-                budget_per_stock = (cash_balance * ratio * budget_cut_ratio) / open_slots
-                logger.info(f"[리스크 Lv2] 연패 {consec_losses}회 → 슬롯 {max_slots_orig}→{reduced_slots}, 예산 ×{budget_cut_ratio}")
-        elif max_streak > 0 and total_recent >= 3 and win_rate < 0.4:
-            # Level 1 (CAUTION): 연패 끊었지만 최근 10건 승률 40% 미만 → 슬롯 3/4
-            reduced_slots = max(1, max_slots_orig * 3 // 4)
-            if current_holdings >= reduced_slots:
-                no_new_buy = True
-                logger.info(f"[리스크 Lv1] 최근 승률 {win_rate:.0%} ({recent_wins}W/{total_recent}) → 슬롯 {max_slots_orig}→{reduced_slots}, 매수 중단")
-            else:
-                open_slots = max(1, reduced_slots - current_holdings)
-                budget_per_stock = (cash_balance * ratio) / open_slots
-                logger.info(f"[리스크 Lv1] 최근 승률 {win_rate:.0%} ({recent_wins}W/{total_recent}) → 슬롯 {max_slots_orig}→{reduced_slots}")
-        else:
-            logger.debug(f"[리스크 Lv0] 정상 (최근 {recent_wins}W {recent_losses}L, 연패 {consec_losses})")
-
     for symbol in target_symbols:
         try:
             strategy = get_strategy_for_symbol(symbol)
@@ -501,13 +544,21 @@ def _run_trading_strategy_impl():
                 elif not stage1_done and current_price >= purchase_price * 1.05:
                     # +5%: 1/3 매도 + 스톱 본절로 이동
                     sell_qty = initial_quantity // 3
+                    if sell_qty <= 0 or quantity < sell_qty:
+                        logger.debug(f"[{symbol}] +5% 도달했지만 단계 익절 수량 부족으로 stage1 유지 (보유={quantity}, 기준={sell_qty})")
+                        time.sleep(0.2)
+                        continue
                     if sell_qty > 0 and quantity >= sell_qty:
+                        sell_qty = _resolve_sell_quantity(symbol, sell_qty)
+                        if sell_qty <= 0:
+                            time.sleep(0.2)
+                            continue
                         try:
                             res = kis_order.place_order(symbol=symbol, quantity=sell_qty, price=0, order_type="SELL")
                             pl = (current_price - purchase_price) * sell_qty
                             _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.EXECUTED, res, realized_pl=pl)
                             send_slack_notification(f"[익절 1/3 +5%] {symbol} ({sell_qty}주) | 현재가: {current_price:.0f}, 스톱 본절 이동")
-                            trade_status[symbol]["quantity"] = quantity - sell_qty
+                            trade_status[symbol]["quantity"] = max(0, quantity - sell_qty)
                             queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": sell_qty})
                         except Exception as e:
                             _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.FAILED, None)
@@ -526,12 +577,16 @@ def _run_trading_strategy_impl():
                     remaining = trade_status[symbol]["quantity"]
                     sell_qty = min(sell_qty, remaining)
                     if sell_qty > 0:
+                        sell_qty = _resolve_sell_quantity(symbol, sell_qty)
+                        if sell_qty <= 0:
+                            time.sleep(0.2)
+                            continue
                         try:
                             res = kis_order.place_order(symbol=symbol, quantity=sell_qty, price=0, order_type="SELL")
                             pl = (current_price - purchase_price) * sell_qty
                             _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.EXECUTED, res, realized_pl=pl)
                             send_slack_notification(f"[익절 2/3 +10%] {symbol} ({sell_qty}주) | 현재가: {current_price:.0f}")
-                            trade_status[symbol]["quantity"] = remaining - sell_qty
+                            trade_status[symbol]["quantity"] = max(0, remaining - sell_qty)
                             queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": sell_qty})
                         except Exception as e:
                             _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.FAILED, None)
@@ -548,17 +603,22 @@ def _run_trading_strategy_impl():
                 if signal == "SELL":
                     if initial_quantity < 3:
                         # 소량 보유 → 전량 매도 (단계 익절 불가한 포지션)
-                        logger.info(f"[{symbol}] RSI 매도 ({quantity}주 전량)")
+                        sell_qty = _resolve_sell_quantity(symbol, quantity)
+                        if sell_qty <= 0:
+                            time.sleep(0.2)
+                            continue
+                        logger.info(f"[{symbol}] RSI 매도 ({sell_qty}주 전량)")
                         try:
-                            res = kis_order.place_order(symbol=symbol, quantity=quantity, price=0, order_type="SELL")
-                            pl = (current_price - purchase_price) * quantity
-                            _log_trade(symbol, "SELL", current_price, quantity, OrderStatus.EXECUTED, res, realized_pl=pl)
-                            send_slack_notification(f"[RSI 매도] {symbol} ({quantity}주) | 현재가: {current_price:.0f}")
-                            trade_status[symbol] = {"bought": False, "purchase_price": 0.0, "quantity": 0, "stop_price": 0.0}
+                            res = kis_order.place_order(symbol=symbol, quantity=sell_qty, price=0, order_type="SELL")
+                            pl = (current_price - purchase_price) * sell_qty
+                            _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.EXECUTED, res, realized_pl=pl)
+                            send_slack_notification(f"[RSI 매도] {symbol} ({sell_qty}주) | 현재가: {current_price:.0f}")
+                            _clear_position(symbol)
+                            _daily_sold_symbols.add(symbol)
                             save_trade_status()
-                            queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": quantity})
+                            queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": sell_qty})
                         except Exception as e:
-                            _log_trade(symbol, "SELL", current_price, quantity, OrderStatus.FAILED, None)
+                            _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.FAILED, None)
                             logger.error(f"[{symbol}] 매도 주문 실패: {e}")
                         time.sleep(0.2)
                         continue
@@ -572,6 +632,52 @@ def _run_trading_strategy_impl():
                         time.sleep(0.2)
                         continue
 
+                # 단계별 최대 손실폭 제한 (-5% 반절, -8% 전량)
+                max_loss_half = getattr(settings, "MAX_LOSS_PCT_HALF", -5.0)
+                max_loss_full = getattr(settings, "MAX_LOSS_PCT_FULL", -8.0)
+                if purchase_price > 0:
+                    loss_pct = (current_price - purchase_price) / purchase_price * 100
+                    half_cut_done = trade_status[symbol].get("half_cut_done", False)
+                    # -8% 이하: 전량 손절
+                    if loss_pct <= max_loss_full:
+                        logger.info(f"[{symbol}] 최대 손실폭 전량 손절! ({loss_pct:.1f}%) 현재가: {current_price}, 매수가: {purchase_price}")
+                        sell_qty = _resolve_sell_quantity(symbol, quantity)
+                        if sell_qty <= 0:
+                            continue
+                        try:
+                            res = kis_order.place_order(symbol=symbol, quantity=sell_qty, price=0, order_type="SELL")
+                            pl = (current_price - purchase_price) * sell_qty
+                            _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.EXECUTED, res, realized_pl=pl)
+                            send_slack_notification(f"[전량 손절 {loss_pct:.1f}%] {symbol} ({sell_qty}주) | 현재가: {current_price:.0f}")
+                            _clear_position(symbol)
+                            _daily_sold_symbols.add(symbol)
+                            save_trade_status()
+                            queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": sell_qty})
+                        except Exception as e:
+                            _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.FAILED, None)
+                            logger.error(f"[{symbol}] 전량 손절 매도 실패: {e}")
+                        continue
+                    # -5% 이하: 1/2 손절 (1회만)
+                    if loss_pct <= max_loss_half and not half_cut_done and quantity >= 2:
+                        sell_qty = quantity // 2
+                        logger.info(f"[{symbol}] 최대 손실폭 1/2 손절! ({loss_pct:.1f}%) 현재가: {current_price}, 매수가: {purchase_price}")
+                        sell_qty = _resolve_sell_quantity(symbol, sell_qty)
+                        if sell_qty <= 0:
+                            continue
+                        try:
+                            res = kis_order.place_order(symbol=symbol, quantity=sell_qty, price=0, order_type="SELL")
+                            pl = (current_price - purchase_price) * sell_qty
+                            _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.EXECUTED, res, realized_pl=pl)
+                            send_slack_notification(f"[1/2 손절 {loss_pct:.1f}%] {symbol} ({sell_qty}주) | 현재가: {current_price:.0f}")
+                            trade_status[symbol]["quantity"] = max(0, quantity - sell_qty)
+                            trade_status[symbol]["half_cut_done"] = True
+                            save_trade_status()
+                            queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": sell_qty})
+                        except Exception as e:
+                            _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.FAILED, None)
+                            logger.error(f"[{symbol}] 1/2 손절 매도 실패: {e}")
+                        continue
+
                 # 손절 조건 확인 (ATR 기반 또는 트레일링 스톱)
                 use_atr = getattr(settings, "USE_ATR_STOP", False) or strategy.get_parameters().get("use_atr_stop", False)
                 atr_mult = getattr(settings, "ATR_MULTIPLIER", 1.5)
@@ -583,16 +689,20 @@ def _run_trading_strategy_impl():
                 if current_price <= stop_price:
                     stop_type = "ATR 손절" if (not stage1_done and use_atr) else "트레일링 스톱"
                     logger.info(f"[{symbol}] {stop_type} 매도! 현재가: {current_price}, 손절가: {stop_price}")
+                    sell_qty = _resolve_sell_quantity(symbol, quantity)
+                    if sell_qty <= 0:
+                        continue
                     try:
-                        res = kis_order.place_order(symbol=symbol, quantity=quantity, price=0, order_type="SELL")
-                        pl = (current_price - purchase_price) * quantity
-                        _log_trade(symbol, "SELL", current_price, quantity, OrderStatus.EXECUTED, res, realized_pl=pl)
-                        send_slack_notification(f"[{stop_type}] {symbol} ({quantity}주) | 현재가: {current_price:.0f}")
-                        trade_status[symbol] = {"bought": False, "purchase_price": 0.0, "quantity": 0, "stop_price": 0.0}
+                        res = kis_order.place_order(symbol=symbol, quantity=sell_qty, price=0, order_type="SELL")
+                        pl = (current_price - purchase_price) * sell_qty
+                        _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.EXECUTED, res, realized_pl=pl)
+                        send_slack_notification(f"[{stop_type}] {symbol} ({sell_qty}주) | 현재가: {current_price:.0f}")
+                        _clear_position(symbol)
+                        _daily_sold_symbols.add(symbol)
                         save_trade_status()
-                        queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": quantity})
+                        queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": sell_qty})
                     except Exception as e:
-                        _log_trade(symbol, "SELL", current_price, quantity, OrderStatus.FAILED, None)
+                        _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.FAILED, None)
                         logger.error(f"[{symbol}] 매도 주문 실패: {e}")
                     continue
 
@@ -624,13 +734,21 @@ def _run_trading_strategy_impl():
                     logger.debug(f"[{symbol}] 매수 스킵: 일별 리스크(손실한도/일일횟수) 도달")
                     time.sleep(0.2)
                     continue
+                if not getattr(settings, "SAME_DAY_REENTRY", False) and symbol in _daily_sold_symbols:
+                    logger.debug(f"[{symbol}] 매수 스킵: 당일 매도 종목 재진입 방지")
+                    time.sleep(0.2)
+                    continue
+                if symbol in _DAILY_BUY_BLACKLIST:
+                    logger.debug(f"[{symbol}] 매수 스킵: 당일 자동 블랙리스트 (정책성 거부 이력)")
+                    time.sleep(0.2)
+                    continue
                 if not _is_entry_allowed_time():
                     logger.debug(f"[{symbol}] 매수 스킵: 진입 허용 시간 아님 (09:{settings.ENTRY_NO_BEFORE_MINUTE:02d}~{settings.ENTRY_NO_AFTER_HOUR}:{settings.ENTRY_NO_AFTER_MINUTE:02d})")
                     time.sleep(0.2)
                     continue
-                # 시장 지수 필터: 지수가 MA 아래면 매수 금지
+                # 시장 지수 필터: 지수가 MA 아래면 매수 금지 (LLM 활성 시 바이패스 → LLM이 판단)
                 market_ok, market_reason = _check_market_filter()
-                if not market_ok:
+                if not market_ok and not settings.USE_LLM_ADVISOR:
                     logger.debug(f"[{symbol}] 매수 스킵: 시장 하락 ({market_reason})")
                     time.sleep(0.2)
                     continue
@@ -647,6 +765,28 @@ def _run_trading_strategy_impl():
                     del _buy_cooldown[s]
                 signal, price_at_signal = strategy.check_signal(symbol, current_price=current_price)
                 if signal == "BUY" and price_at_signal is not None:
+                    try:
+                        budget_per_stock, current_holdings, cash_balance = _compute_buy_budget(effective_max_slots, ratio, budget_multiplier)
+                    except Exception as e:
+                        logger.error(f"[{symbol}] 주문가능현금 재조회 실패: {e}")
+                        time.sleep(0.2)
+                        continue
+                    if current_holdings >= effective_max_slots:
+                        logger.debug(f"[{symbol}] 매수 스킵: 유효 슬롯 가득 참 ({current_holdings}/{effective_max_slots})")
+                        time.sleep(0.2)
+                        continue
+                    # 추격매수 방지: 목표가 대비 슬리피지 필터 (LLM 활성 시 바이패스 → LLM이 판단)
+                    max_slippage_pct = getattr(settings, "ENTRY_MAX_BREAKOUT_SLIPPAGE_PCT", 2.0) or 0
+                    if max_slippage_pct > 0 and not settings.USE_LLM_ADVISOR:
+                        target_price = float(getattr(strategy, "last_indicators", {}).get("target_price") or 0)
+                        if target_price > 0 and price_at_signal > target_price * (1 + max_slippage_pct / 100):
+                            logger.debug(
+                                f"[{symbol}] 매수 스킵: 목표가 대비 {max_slippage_pct}% 이상 이격 "
+                                f"(목표가={target_price:.0f}, 현재가={price_at_signal:.0f})"
+                            )
+                            time.sleep(0.2)
+                            continue
+
                     # 상친거(시가 대비 N% 이상 상승) 매수 방지 — LLM 활성 시 바이패스 (LLM이 판단)
                     if not settings.USE_LLM_ADVISOR:
                         max_up_pct = getattr(settings, "ENTRY_MAX_UP_FROM_OPEN_PCT", 10.0) or 0
@@ -684,8 +824,16 @@ def _run_trading_strategy_impl():
 
                         try:
                             ohlcv_for_llm = kis_market.get_daily_ohlcv(symbol, days=5) or []
-                            llm_indicators = getattr(strategy, "last_indicators", {})
+                            llm_indicators = dict(getattr(strategy, "last_indicators", {}))
                             llm_reason = getattr(strategy, "last_decision_reason", "")
+                            # 바이패스된 필터 정보를 LLM에 전달 (LLM이 최종 판단)
+                            if not market_ok:
+                                llm_indicators["market_filter_warning"] = market_reason
+                            slippage_target = float(llm_indicators.get("target_price") or 0)
+                            if slippage_target > 0 and max_slippage_pct > 0:
+                                slippage = (price_at_signal - slippage_target) / slippage_target * 100
+                                if slippage > 0:
+                                    llm_indicators["slippage_from_target_pct"] = round(slippage, 2)
                             llm_approved, llm_msg = llm_advisor_service.should_buy(
                                 symbol=symbol,
                                 current_price=price_at_signal,
@@ -704,6 +852,12 @@ def _run_trading_strategy_impl():
                         except Exception as e:
                             logger.warning(f"[{symbol}] LLM 어드바이저 오류, 매수 진행 (fail-open): {e}")
 
+                    # 장마감 매도 로직과의 경합 방지: LLM 호출 등으로 시간이 걸린 뒤 매수 직전에 재확인
+                    if not trading_enabled:
+                        logger.info(f"[{symbol}] 매수 스킵: 자동매매 비활성화됨 (장마감 매도 진행 중)")
+                        time.sleep(0.2)
+                        continue
+
                     use_atr_stop = getattr(settings, "USE_ATR_STOP", False)
                     atr_mult = getattr(settings, "ATR_MULTIPLIER", 1.5)
                     atr_val = indicators_service.get_atr(symbol) if use_atr_stop else None
@@ -716,29 +870,41 @@ def _run_trading_strategy_impl():
                         tick_offset = getattr(settings, "BUY_PRICE_TICK_OFFSET", 2) or 0
                         buy_price = _calc_buy_limit_price(price_at_signal, tick_offset)
                         res = kis_order.place_order(symbol=symbol, quantity=quantity_to_buy, price=buy_price, order_type="BUY")
-                        _log_trade(symbol, "BUY", price_at_signal, quantity_to_buy, OrderStatus.EXECUTED, res)
+                        # 체결 후 KIS 잔고 반영까지 대기 → 후속 익절/손절 매도가 "주문가능수량 초과" 오류로 실패하는 것 방지
+                        synced_qty = kis_order.wait_for_holding_at_least(symbol, quantity_to_buy, timeout=15.0, interval=1.5)
+                        effective_qty = synced_qty if synced_qty > 0 else quantity_to_buy
+                        executed_buy_price = _estimate_buy_execution_price(symbol, buy_price, price_at_signal, effective_qty)
+                        stop_shift = executed_buy_price - price_at_signal
+                        _log_trade(symbol, "BUY", executed_buy_price, effective_qty, OrderStatus.EXECUTED, res)
                         st_entry = {
                             "bought": True,
-                            "purchase_price": price_at_signal,
-                            "quantity": quantity_to_buy,
-                            "initial_quantity": quantity_to_buy,
-                            "high_price": price_at_signal,
-                            "stop_price": initial_stop_price,
+                            "purchase_price": executed_buy_price,
+                            "quantity": effective_qty,
+                            "initial_quantity": effective_qty,
+                            "high_price": executed_buy_price,
+                            "stop_price": max(0.0, initial_stop_price + stop_shift),
                             "stage1_sell_done": False,
                             "stage2_sell_done": False,
                         }
                         if use_atr_stop and atr_val is not None:
                             st_entry["atr"] = atr_val
                         trade_status[symbol] = st_entry
-                        logger.info(f"[{symbol}] 매수 성공! 손절가: {initial_stop_price:.0f}")
-                        send_slack_notification(f"[매수 성공] {symbol}({quantity_to_buy}주) | 매수가: {price_at_signal:.0f}")
+                        logger.info(f"[{symbol}] 매수 성공! 체결 추정가: {executed_buy_price:.0f}, 손절가: {st_entry['stop_price']:.0f}")
+                        send_slack_notification(f"[매수 성공] {symbol}({effective_qty}주) | 매수가: {executed_buy_price:.0f}")
                         save_trade_status()
-                        queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "BUY", "price": price_at_signal, "quantity": quantity_to_buy})
+                        queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "BUY", "price": executed_buy_price, "quantity": effective_qty})
                         _buy_cooldown.pop(symbol, None)  # 매수 성공 시 쿨다운 제거
                     except Exception as e:
                         _log_trade(symbol, "BUY", price_at_signal, quantity_to_buy, OrderStatus.FAILED, None)
-                        _buy_cooldown[symbol] = time.time() + _BUY_COOLDOWN_SECONDS
-                        logger.error(f"[{symbol}] 매수 주문 실패 (쿨다운 {_BUY_COOLDOWN_SECONDS}초 설정): {e}")
+                        err_str = str(e)
+                        if _is_permanent_reject(err_str):
+                            _DAILY_BUY_BLACKLIST.add(symbol)
+                            logger.warning(
+                                f"[{symbol}] 정책성 매수 거부 감지 → 당일 자동 블랙리스트 등록 (사유: {err_str})"
+                            )
+                        else:
+                            _buy_cooldown[symbol] = time.time() + _BUY_COOLDOWN_SECONDS
+                            logger.error(f"[{symbol}] 매수 주문 실패 (쿨다운 {_BUY_COOLDOWN_SECONDS}초 설정): {e}")
 
             time.sleep(0.2)
 
@@ -751,33 +917,38 @@ def sell_symbol(symbol: str, quantity: int | None = None) -> dict:
     특정 종목을 개별 매도합니다. quantity가 없거나 0이면 전량 매도.
     :return: {"success": bool, "message": str, "sold_quantity": int or 0}
     """
-    st = trade_status.get(symbol)
-    if not st or not st.get("bought"):
-        return {"success": False, "message": f"{symbol} 보유 종목이 아닙니다.", "sold_quantity": 0}
-    held = st["quantity"]
-    if held <= 0:
-        return {"success": False, "message": f"{symbol} 보유 수량이 없습니다.", "sold_quantity": 0}
-    sell_qty = (quantity if quantity and quantity > 0 else held)
-    sell_qty = min(sell_qty, held)
-    purchase_price = st.get("purchase_price", 0) or 0
-    try:
-        current_price = kis_market.get_current_price(symbol)
-        res = kis_order.place_order(symbol=symbol, quantity=sell_qty, price=0, order_type="SELL")
-        pl = (current_price - purchase_price) * sell_qty if purchase_price else 0.0
-        _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.EXECUTED, res, realized_pl=pl)
-        send_slack_notification(f"[개별 매도] {symbol}, 수량: {sell_qty}, 현재가: {current_price:.0f}")
-        remaining = held - sell_qty
-        if remaining <= 0:
-            trade_status[symbol] = {"bought": False, "purchase_price": 0.0, "quantity": 0, "stop_price": 0.0}
-        else:
-            trade_status[symbol]["quantity"] = remaining
-        save_trade_status()
-        queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": sell_qty})
-        return {"success": True, "message": f"{symbol} {sell_qty}주 매도 체결", "sold_quantity": sell_qty}
-    except Exception as e:
-        _log_trade(symbol, "SELL", 0.0, sell_qty, OrderStatus.FAILED, None)
-        logger.error(f"[{symbol}] 개별 매도 실패: {e}")
-        return {"success": False, "message": str(e), "sold_quantity": 0}
+    with _trade_state_lock:
+        st = trade_status.get(symbol)
+        if not st or not st.get("bought"):
+            return {"success": False, "message": f"{symbol} 보유 종목이 아닙니다.", "sold_quantity": 0}
+        held = st["quantity"]
+        if held <= 0:
+            return {"success": False, "message": f"{symbol} 보유 수량이 없습니다.", "sold_quantity": 0}
+        sell_qty = (quantity if quantity and quantity > 0 else held)
+        sell_qty = min(sell_qty, held)
+        sell_qty = _resolve_sell_quantity(symbol, sell_qty)
+        if sell_qty <= 0:
+            return {"success": False, "message": f"{symbol} KIS 잔고가 없어 매도 불가 (로컬 포지션 정리 완료)", "sold_quantity": 0}
+        purchase_price = st.get("purchase_price", 0) or 0
+        try:
+            current_price = kis_market.get_current_price(symbol)
+            res = kis_order.place_order(symbol=symbol, quantity=sell_qty, price=0, order_type="SELL")
+            pl = (current_price - purchase_price) * sell_qty if purchase_price else 0.0
+            _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.EXECUTED, res, realized_pl=pl)
+            send_slack_notification(f"[개별 매도] {symbol}, 수량: {sell_qty}, 현재가: {current_price:.0f}")
+            remaining = held - sell_qty
+            if remaining <= 0:
+                _clear_position(symbol)
+                _daily_sold_symbols.add(symbol)
+            else:
+                trade_status[symbol]["quantity"] = remaining
+            save_trade_status()
+            queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": sell_qty})
+            return {"success": True, "message": f"{symbol} {sell_qty}주 매도 체결", "sold_quantity": sell_qty}
+        except Exception as e:
+            _log_trade(symbol, "SELL", 0.0, sell_qty, OrderStatus.FAILED, None)
+            logger.error(f"[{symbol}] 개별 매도 실패: {e}")
+            return {"success": False, "message": str(e), "sold_quantity": 0}
 
 
 def buy_symbol(symbol: str, quantity: int | None = None, amount: int | None = None) -> dict:
@@ -789,9 +960,10 @@ def buy_symbol(symbol: str, quantity: int | None = None, amount: int | None = No
     :return: {"success": bool, "message": str, ...}
     """
     # 이미 보유 중이면 에러
-    st = trade_status.get(symbol)
-    if st and st.get("bought"):
-        return {"success": False, "message": f"{symbol} 이미 보유 중인 종목입니다."}
+    with _trade_state_lock:
+        st = trade_status.get(symbol)
+        if st and st.get("bought"):
+            return {"success": False, "message": f"{symbol} 이미 보유 중인 종목입니다."}
 
     # 현재가 조회
     try:
@@ -823,38 +995,73 @@ def buy_symbol(symbol: str, quantity: int | None = None, amount: int | None = No
         initial_stop_price = current_price * (1 - trailing_pct / 100)
 
     # 시장가 매수 주문
-    try:
-        res = kis_order.place_order(symbol=symbol, quantity=qty, price=0, order_type="BUY")
-        _log_trade(symbol, "BUY", current_price, qty, OrderStatus.EXECUTED, res)
-        st_entry = {
-            "bought": True,
-            "purchase_price": current_price,
-            "quantity": qty,
-            "initial_quantity": qty,
-            "high_price": current_price,
-            "stop_price": initial_stop_price,
-            "stage1_sell_done": False,
-            "stage2_sell_done": False,
-        }
-        if use_atr_stop and atr_val is not None:
-            st_entry["atr"] = atr_val
-        trade_status[symbol] = st_entry
-        save_trade_status()
-        logger.info(f"[{symbol}] 수동 매수 성공! {qty}주 @ {current_price:.0f}, 손절가: {initial_stop_price:.0f}")
-        send_slack_notification(f"[수동 매수] {symbol}({qty}주) | 매수가: {current_price:.0f}")
-        queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "BUY", "price": current_price, "quantity": qty})
-        return {
-            "success": True,
-            "message": f"{symbol} {qty}주 매수 체결 (시장가)",
-            "symbol": symbol,
-            "quantity": qty,
-            "price": current_price,
-            "stop_price": initial_stop_price,
-        }
-    except Exception as e:
-        _log_trade(symbol, "BUY", current_price, qty, OrderStatus.FAILED, None)
-        logger.error(f"[{symbol}] 수동 매수 실패: {e}")
-        return {"success": False, "message": f"매수 주문 실패: {e}"}
+    with _trade_state_lock:
+        if trade_status.get(symbol, {}).get("bought"):
+            return {"success": False, "message": f"{symbol} 이미 보유 중인 종목입니다."}
+        try:
+            res = kis_order.place_order(symbol=symbol, quantity=qty, price=0, order_type="BUY")
+            # 체결 후 KIS 잔고 반영까지 대기 (후속 매도 가드와 일관성 유지)
+            synced_qty = kis_order.wait_for_holding_at_least(symbol, qty, timeout=15.0, interval=1.5)
+            effective_qty = synced_qty if synced_qty > 0 else qty
+            executed_buy_price = _estimate_buy_execution_price(symbol, 0, current_price, effective_qty)
+            stop_shift = executed_buy_price - current_price
+            _log_trade(symbol, "BUY", executed_buy_price, effective_qty, OrderStatus.EXECUTED, res)
+            st_entry = {
+                "bought": True,
+                "purchase_price": executed_buy_price,
+                "quantity": effective_qty,
+                "initial_quantity": effective_qty,
+                "high_price": executed_buy_price,
+                "stop_price": max(0.0, initial_stop_price + stop_shift),
+                "stage1_sell_done": False,
+                "stage2_sell_done": False,
+            }
+            if use_atr_stop and atr_val is not None:
+                st_entry["atr"] = atr_val
+            trade_status[symbol] = st_entry
+            save_trade_status()
+            logger.info(f"[{symbol}] 수동 매수 성공! {effective_qty}주 @ {executed_buy_price:.0f}, 손절가: {st_entry['stop_price']:.0f}")
+            send_slack_notification(f"[수동 매수] {symbol}({effective_qty}주) | 매수가: {executed_buy_price:.0f}")
+            queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "BUY", "price": executed_buy_price, "quantity": effective_qty})
+            return {
+                "success": True,
+                "message": f"{symbol} {effective_qty}주 매수 체결 (시장가)",
+                "symbol": symbol,
+                "quantity": effective_qty,
+                "price": executed_buy_price,
+                "stop_price": st_entry["stop_price"],
+            }
+        except Exception as e:
+            _log_trade(symbol, "BUY", current_price, qty, OrderStatus.FAILED, None)
+            logger.error(f"[{symbol}] 수동 매수 실패: {e}")
+            return {"success": False, "message": f"매수 주문 실패: {e}"}
+
+
+def _sell_all_holdings():
+    """trade_status에서 bought=True인 모든 종목을 매도한다. 매도 건수를 반환."""
+    sold = 0
+    for symbol, st in list(trade_status.items()):
+        if st.get("bought"):
+            quantity = st["quantity"]
+            sell_qty = _resolve_sell_quantity(symbol, quantity)
+            if sell_qty <= 0:
+                continue
+            purchase_price = st.get("purchase_price", 0) or 0
+            try:
+                current_price = kis_market.get_current_price(symbol)
+                res = kis_order.place_order(symbol=symbol, quantity=sell_qty, price=0, order_type="SELL")
+                pl = (current_price - purchase_price) * sell_qty if purchase_price else 0.0
+                _log_trade(symbol, "SELL", current_price, sell_qty, OrderStatus.EXECUTED, res, realized_pl=pl)
+                send_slack_notification(f"[장 마감 매도] {symbol}, 수량: {sell_qty}, 현재가: {current_price:.0f}")
+                _clear_position(symbol)
+                _daily_sold_symbols.add(symbol)
+                queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": sell_qty})
+                sold += 1
+            except Exception as e:
+                _log_trade(symbol, "SELL", 0.0, sell_qty, OrderStatus.FAILED, None)
+                logger.error(f"[{symbol}] 장 마감 매도 실패: {e}")
+            time.sleep(1)
+    return sold
 
 
 def sell_all_at_close():
@@ -862,23 +1069,12 @@ def sell_all_at_close():
     global trading_enabled
     trading_enabled = False  # 매도 중 재매수 방지
     logger.info("장 마감 전량 매도 로직을 시작합니다. (자동매매 비활성화)")
-    # trade_status 전체 순회: target_symbols가 아닌 실제 보유 종목 기준
-    for symbol, st in list(trade_status.items()):
-        if st.get("bought"):
-            quantity = st["quantity"]
-            purchase_price = st.get("purchase_price", 0) or 0
-            try:
-                current_price = kis_market.get_current_price(symbol)
-                res = kis_order.place_order(symbol=symbol, quantity=quantity, price=0, order_type="SELL")
-                pl = (current_price - purchase_price) * quantity if purchase_price else 0.0
-                _log_trade(symbol, "SELL", current_price, quantity, OrderStatus.EXECUTED, res, realized_pl=pl)
-                send_slack_notification(f"[장 마감 매도] {symbol}, 수량: {quantity}, 현재가: {current_price:.0f}")
-                trade_status[symbol] = {"bought": False, "purchase_price": 0.0, "quantity": 0, "stop_price": 0.0}
-                queue_broadcast({"type": "trade_event", "symbol": symbol, "side": "SELL", "price": current_price, "quantity": quantity})
-            except Exception as e:
-                _log_trade(symbol, "SELL", 0.0, quantity, OrderStatus.FAILED, None)
-                logger.error(f"[{symbol}] 장 마감 매도 실패: {e}")
-            time.sleep(1)
+    _sell_all_holdings()
+    # 동시 실행 중인 트레이딩 루프가 매수를 완료했을 수 있으므로 잠시 대기 후 재확인
+    time.sleep(3)
+    remaining = _sell_all_holdings()
+    if remaining > 0:
+        logger.info(f"장 마감 매도 2차: 추가 {remaining}건 매도 완료")
     save_trade_status()
 
 
@@ -902,6 +1098,10 @@ def enable_trading_morning():
     """매일 장 시작 전 자동매매를 재활성화합니다 (전일 sell_all_at_close에서 비활성화된 것을 복원)."""
     global trading_enabled
     trading_enabled = True
+    _daily_sold_symbols.clear()
+    _buy_cooldown.clear()
+    _llm_reject_cooldown.clear()
+    _DAILY_BUY_BLACKLIST.clear()
     logger.info("장 시작: 자동매매 활성화")
 
 
