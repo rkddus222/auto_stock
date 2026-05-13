@@ -2,12 +2,21 @@
 .env
 .env.local
 .env.*.local
+.env.backup*
+.env.bak*
 
 # DB 및 로그
 *.db
 *.log
+*.log.*
+*.bak
+*.bak_*
+*.bak.*
 autotrade.db
 autotrade.log
+
+# 임시/디버그 파일
+query
 
 # 인증/키 파일
 token.json

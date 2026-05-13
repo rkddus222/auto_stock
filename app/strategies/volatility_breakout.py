@@ -67,6 +67,7 @@ class VolatilityBreakout(Strategy):
                 current_price = kis_market.get_current_price(symbol)
 
             indicators = {"ma": round(ma20, 2), "current_price": current_price, "k": self.k}
+            llm_active = getattr(settings, "USE_LLM_ADVISOR", False)
 
             # RSI 계산 (매수 진입 차단 + 보유 중 매도 판단에 모두 사용)
             rsi_sell = False
@@ -79,19 +80,20 @@ class VolatilityBreakout(Strategy):
                     rsi_sell = True
 
             # RSI 과매수 시 BUY 신호 자체를 차단 (RSI >= rsi_entry_block 이면 진입 금지)
+            # LLM 활성 시에는 RSI 차단을 바이패스하고 LLM이 최종 판단
             rsi_entry_block = getattr(settings, "RSI_ENTRY_BLOCK", 65.0)
             if rsi_entry_block > 0 and rsi_val >= rsi_entry_block:
-                logger.debug(f"[{symbol}] RSI 과매수 매수 차단 (RSI={rsi_val:.1f} >= {rsi_entry_block})")
-                self.log_decision(symbol, "HOLD", f"RSI 과매수 매수 차단 (RSI={rsi_val:.1f} >= {rsi_entry_block})",
-                                  indicators, current_price, "SKIPPED")
-                # RSI 매도 신호는 보유 중일 때만 유효하므로, 매수 차단 후 SELL 여부도 반환
-                if rsi_sell:
-                    self.log_decision(symbol, "SELL", f"RSI 과매수 (RSI={indicators.get('rsi')} >= {self.rsi_exit_threshold})",
-                                      indicators, current_price, "EXECUTED")
-                    return "SELL", None
-                return "HOLD", None
-
-            llm_active = getattr(settings, "USE_LLM_ADVISOR", False)
+                if not llm_active:
+                    logger.debug(f"[{symbol}] RSI 과매수 매수 차단 (RSI={rsi_val:.1f} >= {rsi_entry_block})")
+                    self.log_decision(symbol, "HOLD", f"RSI 과매수 매수 차단 (RSI={rsi_val:.1f} >= {rsi_entry_block})",
+                                      indicators, current_price, "SKIPPED")
+                    if rsi_sell:
+                        self.log_decision(symbol, "SELL", f"RSI 과매수 (RSI={indicators.get('rsi')} >= {self.rsi_exit_threshold})",
+                                          indicators, current_price, "EXECUTED")
+                        return "SELL", None
+                    return "HOLD", None
+                logger.debug(f"[{symbol}] RSI 과매수이나 LLM 판단 위임 (RSI={rsi_val:.1f} >= {rsi_entry_block})")
+                indicators["rsi_filter"] = "TRIGGERED"
 
             if current_price < ma20:
                 if not llm_active:
